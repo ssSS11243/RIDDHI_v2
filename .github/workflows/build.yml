@@ -1,0 +1,32 @@
+name: Build Riddhi OS
+on: [push, workflow_dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Arduino CLI & ESP32 Core
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> $GITHUB_PATH
+          ./bin/arduino-cli config init
+          ./bin/arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          ./bin/arduino-cli core update-index
+          ./bin/arduino-cli core install esp32:esp32
+          ./bin/arduino-cli lib install "U8g2"
+
+      - name: Compile .bin (OTA Partition)
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs --output-dir ./out Riddhi_OS
+
+      - name: Publish .bin to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Riddhi OS Latest Firmware
+          files: ./out/Riddhi_OS.ino.bin
