@@ -74,7 +74,7 @@ struct CustomShape { char type; int p[7]; };
 CustomShape customShapes[24];
 int customShapeCount = 0;
 
-// Eye Animation & Progressive Sleep State
+// Eye Animation & Progressive Sleep
 float eyeX = 0, eyeTX = 0, eyeY = 0, eyeTY = 0;
 float eyeLH = 24, eyeTLH = 24, eyeRH = 24, eyeTRH = 24;
 unsigned long lastAct = 0, nextBlink = 2200, blinkEnd = 0, nextLook = 2800, tempMoodEnd = 0;
@@ -92,10 +92,10 @@ String tasks[5] = {
 int taskDoneMask = 0;
 int taskIdx = 0;
 
-// Holiday & Birthday Auto-Surprises (0=None, 1=Bday, 2=NewYear, 3=LoveDay, 4=Halloween, 5=Xmas)
+// Holiday & Time
 int autoHoliday = 0;
-int manualHoliday = -1; // -1 = Auto
-int currentHour = 12;
+int manualHoliday = -1;
+int currentHour = 12, currentMin = 0;
 
 // Persistent Data
 int tallyCount = 0;
@@ -105,10 +105,20 @@ String ghRepo = "";
 bool stateDirty = false;
 unsigned long lastSaveMs = 0;
 
+// Autonomous AI Brain State (Shared with Core 0)
+String geminiKey = "";
+String geminiModel = "gemini-2.5-flash-lite";
+bool autoBrainOn = false;
+int brainIntervalMin = 20;
+volatile bool triggerBrainNow = false;
+volatile bool brainHasUpdate = false;
+String brainMoodStr = "", brainToastStr = "", brainBannerT = "", brainBannerS = "", brainScrStr = "";
+String lastBrainLog = "Autonomous brain idle.";
+
 // Desk Banner, AI, Pomodoro
 String bannerTop = "FOCUS MODE";
 String bannerSub = "Do Not Disturb";
-String aiReply = "Ready! Ask anything or invent a face.";
+String aiReply = "Ready! Speak or type any multi-step command.";
 ScreenMode pendingScreen = SCR_FACE;
 unsigned long pendingAt = 0;
 String toastMsg = "";
@@ -149,7 +159,7 @@ bool isAP = false;
 
 // ================= STORAGE =================
 void saveNow() {
-  prefs.begin("riddhi61", false);
+  prefs.begin("riddhi62", false);
   prefs.putInt("care", careLevel);
   prefs.putBool("wFx", weatherFxOn);
   prefs.putInt("tMask", taskDoneMask);
@@ -161,13 +171,17 @@ void saveNow() {
   prefs.putInt("hiP", hiPong);
   prefs.putInt("hiC", hiCatch);
   prefs.putString("gh", ghRepo);
+  prefs.putString("gKey", geminiKey);
+  prefs.putString("gMod", geminiModel);
+  prefs.putBool("aBrn", autoBrainOn);
+  prefs.putInt("bInt", brainIntervalMin);
   prefs.end();
   stateDirty = false;
   lastSaveMs = millis();
 }
 
 void loadAll() {
-  prefs.begin("riddhi61", true);
+  prefs.begin("riddhi62", true);
   careLevel    = prefs.getInt("care", 90);
   weatherFxOn  = prefs.getBool("wFx", true);
   taskDoneMask = prefs.getInt("tMask", 0);
@@ -175,13 +189,17 @@ void loadAll() {
     String s = prefs.getString(("tk" + String(i)).c_str(), "");
     if (s.length() > 0) tasks[i] = s;
   }
-  tallyCount = prefs.getInt("tCnt", 0);
-  tallyLabel = prefs.getString("tLbl", "COUNT");
-  hiSpace    = prefs.getInt("hiS", 0);
-  hiFlappy   = prefs.getInt("hiF", 0);
-  hiPong     = prefs.getInt("hiP", 0);
-  hiCatch    = prefs.getInt("hiC", 0);
-  ghRepo     = prefs.getString("gh", "");
+  tallyCount       = prefs.getInt("tCnt", 0);
+  tallyLabel       = prefs.getString("tLbl", "COUNT");
+  hiSpace          = prefs.getInt("hiS", 0);
+  hiFlappy         = prefs.getInt("hiF", 0);
+  hiPong           = prefs.getInt("hiP", 0);
+  hiCatch          = prefs.getInt("hiC", 0);
+  ghRepo           = prefs.getString("gh", "");
+  geminiKey        = prefs.getString("gKey", "");
+  geminiModel      = prefs.getString("gMod", "gemini-2.5-flash-lite");
+  autoBrainOn      = prefs.getBool("aBrn", false);
+  brainIntervalMin = prefs.getInt("bInt", 20);
   prefs.end();
 }
 
@@ -196,12 +214,49 @@ String jsonEscape(const String& s) {
   return out;
 }
 
-void toast(const String& s, unsigned long ms = 1500) { toastMsg = s; toastEnd = millis() + ms; }
-
-void boostCare(int amt) {
-  careLevel = constrain(careLevel + amt, 0, 100);
-  stateDirty = true;
+// Flexible lightweight JSON string extractor (handles whitespace & escaped quotes)
+String extractJsonStr(const String& json, const char* key) {
+  String pat = String("\"") + key + "\"";
+  int idx = json.indexOf(pat);
+  if (idx < 0) return "";
+  int col = json.indexOf(':', idx + pat.length());
+  if (col < 0) return "";
+  int q1 = json.indexOf('"', col + 1);
+  if (q1 < 0) return "";
+  String res = "";
+  for (int i = q1 + 1; i < (int)json.length(); i++) {
+    char c = json[i];
+    if (c == '\\' && i + 1 < (int)json.length()) {
+      char nx = json[++i];
+      if (nx == 'n') res += ' ';
+      else res += nx;
+    } else if (c == '"') {
+      break;
+    } else {
+      res += c;
+    }
+  }
+  return res;
 }
+
+Mood parseMoodName(String m) {
+  m.toUpperCase();
+  if (m == "HYPED" || m == "HAPPY") return MOOD_HYPED;
+  if (m == "ZEN") return MOOD_ZEN;
+  if (m == "GRUMPY" || m == "ANGRY") return MOOD_GRUMPY;
+  if (m == "SHOCKED" || m == "SURPRISED") return MOOD_SHOCKED;
+  if (m == "SUS" || m == "SUSPICIOUS") return MOOD_SUSPICIOUS;
+  if (m == "SMUG") return MOOD_SMUG;
+  if (m == "DIZZY") return MOOD_DIZZY;
+  if (m == "LOVE") return MOOD_LOVE;
+  if (m == "SICK") return MOOD_SICK;
+  if (m == "DROWSY") return MOOD_DROWSY;
+  if (m == "SLEEP") return MOOD_SLEEP;
+  return MOOD_CHILL;
+}
+
+void toast(const String& s, unsigned long ms = 1800) { toastMsg = s; toastEnd = millis() + ms; }
+void boostCare(int amt) { careLevel = constrain(careLevel + amt, 0, 100); stateDirty = true; }
 
 void rBox(int x, int y, int w, int h, int r) {
   if (w < 2 || h < 2) return;
@@ -211,56 +266,41 @@ void rFrame(int x, int y, int w, int h, int r) {
   if (w < 2 || h < 2) return;
   u8g2.drawRFrame(x, y, w, h, max(0, min(r, min(w / 2, h / 2))));
 }
-
 void drawMiniHeart(int x, int y) {
   u8g2.drawPixel(x - 1, y); u8g2.drawPixel(x + 1, y);
-  u8g2.drawHLine(x - 2, y + 1, 5);
-  u8g2.drawHLine(x - 1, y + 2, 3);
-  u8g2.drawPixel(x, y + 3);
+  u8g2.drawHLine(x - 2, y + 1, 5); u8g2.drawHLine(x - 1, y + 2, 3); u8g2.drawPixel(x, y + 3);
 }
-
 void drawSparkle(int cx, int cy, int s) {
-  u8g2.drawHLine(cx - s, cy, s * 2 + 1);
-  u8g2.drawVLine(cx, cy - s, s * 2 + 1);
+  u8g2.drawHLine(cx - s, cy, s * 2 + 1); u8g2.drawVLine(cx, cy - s, s * 2 + 1);
 }
-
 void drawTopBar(const char* left, const char* right = "") {
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(3, 9, left);
   if (strlen(right) > 0) {
     int rw = u8g2.getStrWidth(right);
     rBox(124 - rw - 4, 1, rw + 6, 10, 3);
-    u8g2.setDrawColor(0);
-    u8g2.drawStr(124 - rw - 1, 9, right);
-    u8g2.setDrawColor(1);
+    u8g2.setDrawColor(0); u8g2.drawStr(124 - rw - 1, 9, right); u8g2.setDrawColor(1);
   }
   u8g2.drawHLine(0, 12, 128);
 }
-
 void drawWrapped(const String& txt, int y0, int lh, int maxL, int maxC) {
   int len = txt.length(), idx = 0, ln = 0;
   while (idx < len && ln < maxL) {
     while (idx < len && txt[idx] == ' ') idx++;
     if (idx >= len) break;
     int end = min(idx + maxC, len);
-    if (end < len && txt[end] != ' ') {
-      int sp = txt.lastIndexOf(' ', end);
-      if (sp > idx) end = sp;
-    }
+    if (end < len && txt[end] != ' ') { int sp = txt.lastIndexOf(' ', end); if (sp > idx) end = sp; }
     String line = txt.substring(idx, end); line.trim();
     u8g2.drawStr(3, y0 + ln * lh, line.c_str());
     idx = end; ln++;
   }
 }
-
-bool isGame(ScreenMode s) {
-  return (s == SCR_SPACE || s == SCR_FLAPPY || s == SCR_PONG || s == SCR_CATCH);
-}
+bool isGame(ScreenMode s) { return (s == SCR_SPACE || s == SCR_FLAPPY || s == SCR_PONG || s == SCR_CATCH); }
 
 void drawProgress(int pct, const char* msg) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_logisoso18_tf);
-  u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI 6.1")) / 2, 29, "RIDDHI 6.1");
+  u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI 6.2")) / 2, 29, "RIDDHI 6.2");
   rFrame(16, 38, 96, 8, 4);
   if (pct > 3) rBox(18, 40, (92 * constrain(pct, 0, 100)) / 100, 4, 2);
   u8g2.setFont(u8g2_font_5x7_tf);
@@ -273,8 +313,7 @@ void playBootAnimation() {
   for (int w = 4; w <= 120; w += 12) {
     u8g2.clearBuffer();
     u8g2.drawHLine(64 - w / 2, 32, w);
-    u8g2.drawDisc(64 - w / 2, 32, 2);
-    u8g2.drawDisc(64 + w / 2, 32, 2);
+    u8g2.drawDisc(64 - w / 2, 32, 2); u8g2.drawDisc(64 + w / 2, 32, 2);
     u8g2.sendBuffer(); delay(22);
   }
   for (int f = 1; f <= 8; f++) {
@@ -284,25 +323,22 @@ void playBootAnimation() {
     u8g2.drawPixel(64 - d, 32 + d / 2); u8g2.drawPixel(64 + d, 32 + d / 2);
     u8g2.setFont(u8g2_font_logisoso16_tf);
     u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI")) / 2, 36, "RIDDHI");
-    u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(44, 50, "OS v6.1");
+    u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(36, 50, "AI OS v6.2");
     u8g2.sendBuffer(); delay(55);
   }
   for (int h = 2; h <= 24; h += 3) {
     u8g2.clearBuffer();
-    rBox(28, 32 - h / 2, 26, h, 5);
-    rBox(74, 32 - h / 2, 26, h, 5);
+    rBox(28, 32 - h / 2, 26, h, 5); rBox(74, 32 - h / 2, 26, h, 5);
     if (h > 12) {
       u8g2.setDrawColor(0);
-      u8g2.drawBox(33, 32 - h / 2 + 5, 5, 5);
-      u8g2.drawBox(79, 32 - h / 2 + 5, 5, 5);
+      u8g2.drawBox(33, 32 - h / 2 + 5, 5, 5); u8g2.drawBox(79, 32 - h / 2 + 5, 5, 5);
       u8g2.setDrawColor(1);
     }
     u8g2.sendBuffer(); delay(28);
   }
 }
 
-// ================= CORE 0 WEATHER & OTA =================
+// ================= CORE 0: WEATHER + AUTONOMOUS AI BRAIN =================
 float extractVal(const String& json, const char* key, float fb) {
   int ci = json.indexOf("\"current\":{"); if (ci < 0) return fb;
   int ki = json.indexOf(key, ci); if (ki < 0) return fb;
@@ -329,13 +365,82 @@ void bgWeather() {
   http.end();
 }
 
+void bgAutoBrain() {
+  String keyCopy = "", modCopy = "", pendingTasks = "";
+  float tempCopy = 26.0f; int careCopy = 90, hrCopy = 12, mnCopy = 0, codeCopy = 0;
+
+  if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    keyCopy = geminiKey; modCopy = geminiModel;
+    tempCopy = wTemp; codeCopy = wCode; careCopy = careLevel;
+    hrCopy = currentHour; mnCopy = currentMin;
+    for (int i = 0; i < 5; i++) {
+      if (!(taskDoneMask & (1 << i)) && tasks[i].length() > 0) {
+        if (pendingTasks.length() > 0) pendingTasks += ", ";
+        pendingTasks += tasks[i];
+      }
+    }
+    xSemaphoreGive(netMutex);
+  }
+  if (keyCopy.length() < 10) return;
+
+  String ctx = "Time:" + String(hrCopy) + ":" + (mnCopy < 10 ? "0" : "") + String(mnCopy) +
+               " IST, Temp:" + String(tempCopy, 1) + "C, WCode:" + String(codeCopy) +
+               ", Care:" + String(careCopy) + "%, Todo:[" + jsonEscape(pendingTasks) + "]";
+  String prompt = "You are Riddhi, an autonomous ESP32 desk robot. Based on context (" + ctx +
+                  "), pick a fitting mood and short witty nudge (<22 chars). Return ONLY raw JSON: "
+                  "{\\\"mood\\\":\\\"CHILL|HYPED|ZEN|SUS|SMUG|LOVE\\\",\\\"toast\\\":\\\"short ASCII\\\",\\\"scr\\\":\\\"FACE|TASKS|BANNER\\\",\\\"bt\\\":\\\"\\\",\\\"bs\\\":\\\"\\\"}";
+
+  String body = "{\"generationConfig\":{\"responseMimeType\":\"application/json\",\"maxOutputTokens\":120},"
+                "\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"" + prompt + "\"}]}]}";
+
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http; http.setTimeout(9000);
+  String url = "https://generativelanguage.googleapis.com/v1beta/models/" + modCopy + ":generateContent?key=" + keyCopy;
+
+  if (http.begin(client, url)) {
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    if (code == HTTP_CODE_OK) {
+      String resp = http.getString();
+      // Gemini wraps JSON inside "text": "{...}"
+      String inner = extractJsonStr(resp, "text");
+      if (inner.length() > 5) {
+        String m = extractJsonStr(inner, "mood");
+        String ts = extractJsonStr(inner, "toast");
+        String sc = extractJsonStr(inner, "scr");
+        String bt = extractJsonStr(inner, "bt");
+        String bs = extractJsonStr(inner, "bs");
+        if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          brainMoodStr = m; brainToastStr = ts; brainScrStr = sc;
+          brainBannerT = bt; brainBannerS = bs;
+          lastBrainLog = "[" + String(hrCopy) + ":" + (mnCopy < 10 ? "0" : "") + String(mnCopy) + "] " + m + ": " + ts;
+          brainHasUpdate = true;
+          xSemaphoreGive(netMutex);
+        }
+      }
+    } else {
+      if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        lastBrainLog = "Brain HTTP " + String(code);
+        xSemaphoreGive(netMutex);
+      }
+    }
+  }
+  http.end();
+}
+
 void core0Task(void* pv) {
-  unsigned long lastW = 0;
+  unsigned long lastW = 0, lastB = 0;
   for (;;) {
     if (!netPaused && WiFi.status() == WL_CONNECTED) {
       unsigned long now = millis();
       if (fetchWeatherNow || lastW == 0 || (now - lastW > WEATHER_INTERVAL_MS)) {
         fetchWeatherNow = false; bgWeather(); lastW = millis();
+      }
+      unsigned long bIntMs = (unsigned long)max(2, brainIntervalMin) * 60000UL;
+      if (triggerBrainNow || (autoBrainOn && geminiKey.length() >= 10 && (now - lastB > bIntMs))) {
+        triggerBrainNow = false;
+        bgAutoBrain();
+        lastB = millis();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -365,20 +470,19 @@ void runGitHubOTA() {
 // ================= HOLIDAY & TIME CHECK =================
 void checkCalendarSurprises() {
   static unsigned long lastChk = 0;
-  if (millis() - lastChk < 60000UL && lastChk != 0) return;
+  if (millis() - lastChk < 30000UL && lastChk != 0) return;
   lastChk = millis();
   struct tm ti;
   if (!getLocalTime(&ti, 5)) return;
-  currentHour = ti.tm_hour;
+  currentHour = ti.tm_hour; currentMin = ti.tm_min;
   int m = ti.tm_mon + 1, d = ti.tm_mday;
-  if (m == 10 && d == 4) autoHoliday = 1;       // Birthday (Oct 4)
-  else if (m == 1 && d == 1) autoHoliday = 2;   // New Year
-  else if (m == 2 && d == 14) autoHoliday = 3;  // Valentine's
-  else if (m == 10 && d == 31) autoHoliday = 4; // Halloween
-  else if (m == 12 && d == 25) autoHoliday = 5; // Christmas
+  if (m == 10 && d == 4) autoHoliday = 1;
+  else if (m == 1 && d == 1) autoHoliday = 2;
+  else if (m == 2 && d == 14) autoHoliday = 3;
+  else if (m == 10 && d == 31) autoHoliday = 4;
+  else if (m == 12 && d == 25) autoHoliday = 5;
   else autoHoliday = 0;
 }
-
 int getActiveHoliday() { return (manualHoliday >= 0) ? manualHoliday : autoHoliday; }
 
 // ================= CUSTOM AI FACE =================
@@ -422,50 +526,31 @@ void drawCustomFace(int by) {
 void drawWeatherAndHolidayFX(unsigned long now, int& shiverX) {
   shiverX = 0;
   int hol = getActiveHoliday();
-
-  // Holiday Overlays
-  if (hol == 1) { // Birthday Cake + Flickering Candle
-    rFrame(106, 48, 16, 12, 2);
-    u8g2.drawHLine(106, 53, 16);
-    u8g2.drawVLine(114, 43, 5);
+  if (hol == 1) {
+    rFrame(106, 48, 16, 12, 2); u8g2.drawHLine(106, 53, 16); u8g2.drawVLine(114, 43, 5);
     u8g2.drawDisc(114, 41 - ((now / 180) % 2), 1);
     u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(38, 8, "HBD VENU!");
-  } else if (hol == 2) { // New Year Fireworks
+  } else if (hol == 2) {
     int ph = (now / 200) % 2;
     drawSparkle(14, 16, ph ? 4 : 2); drawSparkle(114, 18, ph ? 2 : 4);
-    drawSparkle(18, 50, ph ? 2 : 3); drawSparkle(110, 50, ph ? 3 : 2);
     u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(32, 8, "HAPPY NEW YR!");
-  } else if (hol == 3) { // Valentine's Floating Hearts
-    drawMiniHeart(14, 24 - ((now / 120) % 12));
-    drawMiniHeart(114, 28 - ((now / 150) % 12));
-  } else if (hol == 4) { // Halloween Bats/Spooky
+  } else if (hol == 3) {
+    drawMiniHeart(14, 24 - ((now / 120) % 12)); drawMiniHeart(114, 28 - ((now / 150) % 12));
+  } else if (hol == 4) {
     u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(46, 8, "BOO! ^-^");
-  } else if (hol == 5) { // Christmas Snowfall
-    for (int i = 0; i < 8; i++) {
-      int sx = (i * 17 + 7) % 124;
-      int sy = ((now / 45) + i * 11) % 62;
-      if (sx < 22 || sx > 106) u8g2.drawPixel(sx, sy);
-    }
+  } else if (hol == 5) {
+    for (int i = 0; i < 8; i++) { int sx = (i * 17 + 7) % 124, sy = ((now / 45) + i * 11) % 62; if (sx < 22 || sx > 106) u8g2.drawPixel(sx, sy); }
   }
 
-  // Live Weather FX (when enabled & loaded)
   if (!weatherFxOn || !weatherReady) return;
   int code = 0; float temp = 26.0f;
   if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(5)) == pdTRUE) { code = wCode; temp = wTemp; xSemaphoreGive(netMutex); }
-
-  if (code >= 51) { // Rain / Drizzle / Storm streaks on edges
-    for (int i = 0; i < 6; i++) {
-      int rx = (i < 3) ? (6 + i * 6) : (106 + (i - 3) * 6);
-      int ry = ((now / 25) + i * 13) % 58;
-      u8g2.drawLine(rx, ry, rx - 2, ry + 5);
-    }
-  } else if (code <= 1 && currentHour >= 7 && currentHour <= 17) { // Sunny Icon top-right
-    u8g2.drawDisc(120, 7, 2);
-    if ((now / 500) % 2 == 0) drawSparkle(120, 7, 4);
+  if (code >= 51) {
+    for (int i = 0; i < 6; i++) { int rx = (i < 3) ? (6 + i * 6) : (106 + (i - 3) * 6), ry = ((now / 25) + i * 13) % 58; u8g2.drawLine(rx, ry, rx - 2, ry + 5); }
+  } else if (code <= 1 && currentHour >= 7 && currentHour <= 17) {
+    u8g2.drawDisc(120, 7, 2); if ((now / 500) % 2 == 0) drawSparkle(120, 7, 4);
   }
-  if (temp < 18.0f) { // Cold shiver!
-    shiverX = ((now / 90) % 2 == 0) ? -1 : 1;
-  }
+  if (temp < 18.0f) shiverX = ((now / 90) % 2 == 0) ? -1 : 1;
 }
 
 // ================= AUTONOMOUS FACE ENGINE =================
@@ -473,21 +558,14 @@ void drawFace() {
   unsigned long now = millis(); float t = now * 0.003f;
   unsigned long idle = now - lastAct;
 
-  // Temporary mood expiry
-  if (tempMoodEnd > 0 && now > tempMoodEnd) {
-    tempMoodEnd = 0;
-    currentMood = (careLevel < 35) ? MOOD_SICK : MOOD_CHILL;
-  }
-
-  // Progressive Sleep Pipeline: Active -> Drowsy (35s) -> Deep Sleep (50s)
+  if (tempMoodEnd > 0 && now > tempMoodEnd) { tempMoodEnd = 0; currentMood = (careLevel < 35) ? MOOD_SICK : MOOD_CHILL; }
   if (currentMood == MOOD_CHILL || currentMood == MOOD_SICK || currentMood == MOOD_DROWSY) {
     if (idle > SLEEP_TIMEOUT_MS) { currentMood = MOOD_SLEEP; wasSleeping = true; }
-    else if (idle > DROWSY_TIMEOUT_MS) { currentMood = MOOD_DROWSY; }
-    else if (currentMood == MOOD_CHILL && careLevel < 35) { currentMood = MOOD_SICK; }
+    else if (idle > DROWSY_TIMEOUT_MS) currentMood = MOOD_DROWSY;
+    else if (currentMood == MOOD_CHILL && careLevel < 35) currentMood = MOOD_SICK;
   }
 
-  int shiverX = 0;
-  drawWeatherAndHolidayFX(now, shiverX);
+  int shiverX = 0; drawWeatherAndHolidayFX(now, shiverX);
 
   eyeX += (eyeTX - eyeX) * 0.22f; eyeY += (eyeTY - eyeY) * 0.22f;
   eyeLH += (eyeTLH - eyeLH) * 0.42f; eyeRH += (eyeTRH - eyeRH) * 0.42f;
@@ -495,18 +573,14 @@ void drawFace() {
 
   switch (currentMood) {
     case MOOD_CHILL: {
-      if (blinkPhase == 0 && now > nextBlink) {
-        blinkPhase = 1; bool wink = (random(0, 6) == 0);
-        eyeTLH = 3; eyeTRH = wink ? 24 : 3; blinkEnd = now + (wink ? 240 : 90);
-      } else if (blinkPhase == 1 && now > blinkEnd) { blinkPhase = 2; eyeTLH = 24; eyeTRH = 24; blinkEnd = now + 100; }
+      if (blinkPhase == 0 && now > nextBlink) { blinkPhase = 1; bool wink = (random(0, 6) == 0); eyeTLH = 3; eyeTRH = wink ? 24 : 3; blinkEnd = now + (wink ? 240 : 90); }
+      else if (blinkPhase == 1 && now > blinkEnd) { blinkPhase = 2; eyeTLH = 24; eyeTRH = 24; blinkEnd = now + 100; }
       else if (blinkPhase == 2 && now > blinkEnd) { blinkPhase = 0; nextBlink = now + random(2400, 4800); }
       if (now > nextLook) { eyeTX = random(0, 3) ? random(-10, 11) : 0; eyeTY = random(-4, 5); nextLook = now + random(2200, 4500); }
       int lh = (int)round(eyeLH), rh = (int)round(eyeRH), cy = 29 + oy, lx = 28 + ox, rx = 74 + ox;
       rBox(lx, cy - lh / 2, 26, lh, 5); rBox(rx, cy - rh / 2, 26, rh, 5);
-      // Sunglasses bridge on clear sunny daytime when Weather FX is ON
       if (weatherFxOn && weatherReady && wCode <= 1 && currentHour >= 9 && currentHour <= 16) {
-        u8g2.drawHLine(lx + 26, cy - 3, rx - (lx + 26));
-        u8g2.drawHLine(lx + 26, cy - 2, rx - (lx + 26));
+        u8g2.drawHLine(lx + 26, cy - 3, rx - (lx + 26)); u8g2.drawHLine(lx + 26, cy - 2, rx - (lx + 26));
       } else {
         u8g2.setDrawColor(0);
         if (lh > 12) u8g2.drawBox(lx + 5 + ox / 4, cy - lh / 2 + 5, 5, 5);
@@ -518,97 +592,33 @@ void drawFace() {
     }
     case MOOD_HYPED: {
       int b = (int)round(sin(t * 3.0f) * 2.0f);
-      u8g2.drawTriangle(28, 36 + b, 41, 20 + b, 54, 36 + b);
-      u8g2.drawTriangle(74, 36 + b, 87, 20 + b, 100, 36 + b);
-      u8g2.setDrawColor(0);
-      u8g2.drawTriangle(33, 36 + b, 41, 26 + b, 49, 36 + b);
-      u8g2.drawTriangle(79, 36 + b, 87, 26 + b, 95, 36 + b);
-      u8g2.setDrawColor(1);
+      u8g2.drawTriangle(28, 36 + b, 41, 20 + b, 54, 36 + b); u8g2.drawTriangle(74, 36 + b, 87, 20 + b, 100, 36 + b);
+      u8g2.setDrawColor(0); u8g2.drawTriangle(33, 36 + b, 41, 26 + b, 49, 36 + b); u8g2.drawTriangle(79, 36 + b, 87, 26 + b, 95, 36 + b); u8g2.setDrawColor(1);
       u8g2.drawCircle(64, 43 + b, 7, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
       break;
     }
-    case MOOD_ZEN: {
-      rBox(28, 31 + br, 26, 4, 2); rBox(74, 31 + br, 26, 4, 2);
-      u8g2.drawCircle(64, 43 + br, 5, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
-      break;
-    }
+    case MOOD_ZEN: rBox(28, 31 + br, 26, 4, 2); rBox(74, 31 + br, 26, 4, 2); u8g2.drawCircle(64, 43 + br, 5, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
     case MOOD_GRUMPY: {
       int sh = ((now / 70) % 2 == 0) ? -1 : 1;
       rBox(28 + sh, 22, 26, 20, 4); rBox(74 + sh, 22, 26, 20, 4);
-      u8g2.setDrawColor(0);
-      u8g2.drawTriangle(26 + sh, 18, 56 + sh, 18, 56 + sh, 32);
-      u8g2.drawTriangle(72 + sh, 18, 102 + sh, 18, 72 + sh, 32);
-      u8g2.setDrawColor(1);
-      u8g2.drawHLine(56, 50, 16);
-      break;
+      u8g2.setDrawColor(0); u8g2.drawTriangle(26 + sh, 18, 56 + sh, 18, 56 + sh, 32); u8g2.drawTriangle(72 + sh, 18, 102 + sh, 18, 72 + sh, 32); u8g2.setDrawColor(1);
+      u8g2.drawHLine(56, 50, 16); break;
     }
-    case MOOD_SHOCKED: {
-      u8g2.drawCircle(41, 30, 13); u8g2.drawDisc(41, 30, 5);
-      u8g2.drawCircle(87, 30, 13); u8g2.drawDisc(87, 30, 5);
-      u8g2.drawCircle(64, 49, 4);
-      break;
-    }
-    case MOOD_SUSPICIOUS: { // Side-eye squint
-      rBox(28, 28, 26, 8, 3); rBox(74, 28, 26, 8, 3);
-      u8g2.setDrawColor(0); u8g2.drawBox(46, 30, 5, 4); u8g2.drawBox(92, 30, 5, 4); u8g2.setDrawColor(1);
-      u8g2.drawLine(56, 48, 72, 46);
-      break;
-    }
-    case MOOD_SMUG: { // Half-lidded grin
-      rBox(28, 24, 26, 16, 5); rBox(74, 24, 26, 16, 5);
-      u8g2.setDrawColor(0); u8g2.drawBox(26, 20, 30, 10); u8g2.drawBox(72, 20, 30, 10); u8g2.setDrawColor(1);
-      u8g2.drawLine(56, 48, 68, 48); u8g2.drawLine(68, 48, 73, 44);
-      break;
-    }
-    case MOOD_DIZZY: {
-      int dx = (int)(cos(t * 3.5f) * 4.5f), dy = (int)(sin(t * 3.5f) * 4.5f);
-      u8g2.drawCircle(41, 30, 12); u8g2.drawDisc(41 + dx, 30 + dy, 4);
-      u8g2.drawCircle(87, 30, 12); u8g2.drawDisc(87 - dx, 30 - dy, 4);
-      u8g2.drawCircle(64, 49, 3);
-      break;
-    }
-    case MOOD_LOVE: {
-      int p = ((now / 280) % 2 == 0) ? 1 : 0, cx[2] = {41, 87};
-      for (int i = 0; i < 2; i++) {
-        u8g2.drawDisc(cx[i] - 5, 27, 6 + p); u8g2.drawDisc(cx[i] + 5, 27, 6 + p);
-        u8g2.drawTriangle(cx[i] - 11 - p, 29, cx[i] + 11 + p, 29, cx[i], 42 + p);
-      }
-      drawMiniHeart(64, 15 - ((now / 110) % 10));
-      u8g2.drawCircle(64, 46, 5, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
-      break;
-    }
-    case MOOD_SICK: { // Bored / Low Care thermometer face
-      rBox(28, 30 + br, 24, 9, 3); rBox(76, 30 + br, 24, 9, 3);
-      u8g2.drawCircle(64, 52, 5, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
-      // Little thermometer sticking out of mouth
-      u8g2.drawLine(68, 49, 82, 43); u8g2.drawDisc(83, 43, 2);
-      u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(28, 12, "Bored... Wave!");
-      break;
-    }
-    case MOOD_DROWSY: { // Droopy eyelids + periodic yawn
-      rBox(28, 32 + br, 26, 7, 3); rBox(74, 32 + br, 26, 7, 3);
-      bool yawn = ((now / 1500) % 3 == 0);
-      if (yawn) u8g2.drawCircle(64, 48 + br, 5);
-      else u8g2.drawHLine(59, 48 + br, 10);
-      break;
-    }
-    case MOOD_SLEEP: {
-      u8g2.drawHLine(28, 35 + br, 26); u8g2.drawHLine(74, 35 + br, 26);
-      int ph = (now / 120) % 18;
-      u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(96 + ph / 4, 26 - ph / 2, "z");
-      u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(106 + ((ph + 6) % 12) / 3, 20 - ((ph + 6) % 16) / 2, "Z");
-      break;
-    }
-    case MOOD_THINK: {
-      rBox(34, 20, 22, 18, 5); rBox(78, 20, 22, 18, 5);
-      for (int i = 0; i < 3; i++) u8g2.drawDisc(54 + i * 10, 10 - (i == (now / 200) % 3 ? 3 : 0), 2);
-      break;
-    }
+    case MOOD_SHOCKED: u8g2.drawCircle(41, 30, 13); u8g2.drawDisc(41, 30, 5); u8g2.drawCircle(87, 30, 13); u8g2.drawDisc(87, 30, 5); u8g2.drawCircle(64, 49, 4); break;
+    case MOOD_SUSPICIOUS: rBox(28, 28, 26, 8, 3); rBox(74, 28, 26, 8, 3); u8g2.setDrawColor(0); u8g2.drawBox(46, 30, 5, 4); u8g2.drawBox(92, 30, 5, 4); u8g2.setDrawColor(1); u8g2.drawLine(56, 48, 72, 46); break;
+    case MOOD_SMUG: rBox(28, 24, 26, 16, 5); rBox(74, 24, 26, 16, 5); u8g2.setDrawColor(0); u8g2.drawBox(26, 20, 30, 10); u8g2.drawBox(72, 20, 30, 10); u8g2.setDrawColor(1); u8g2.drawLine(56, 48, 68, 48); u8g2.drawLine(68, 48, 73, 44); break;
+    case MOOD_DIZZY: { int dx = (int)(cos(t * 3.5f) * 4.5f), dy = (int)(sin(t * 3.5f) * 4.5f); u8g2.drawCircle(41, 30, 12); u8g2.drawDisc(41 + dx, 30 + dy, 4); u8g2.drawCircle(87, 30, 12); u8g2.drawDisc(87 - dx, 30 - dy, 4); u8g2.drawCircle(64, 49, 3); break; }
+    case MOOD_LOVE: { int p = ((now / 280) % 2 == 0) ? 1 : 0, cx[2] = {41, 87}; for (int i = 0; i < 2; i++) { u8g2.drawDisc(cx[i] - 5, 27, 6 + p); u8g2.drawDisc(cx[i] + 5, 27, 6 + p); u8g2.drawTriangle(cx[i] - 11 - p, 29, cx[i] + 11 + p, 29, cx[i], 42 + p); } drawMiniHeart(64, 15 - ((now / 110) % 10)); u8g2.drawCircle(64, 46, 5, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break; }
+    case MOOD_SICK: rBox(28, 30 + br, 24, 9, 3); rBox(76, 30 + br, 24, 9, 3); u8g2.drawCircle(64, 52, 5, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT); u8g2.drawLine(68, 49, 82, 43); u8g2.drawDisc(83, 43, 2); u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(28, 12, "Bored... Wave!"); break;
+    case MOOD_DROWSY: rBox(28, 32 + br, 26, 7, 3); rBox(74, 32 + br, 26, 7, 3); if ((now / 1500) % 3 == 0) u8g2.drawCircle(64, 48 + br, 5); else u8g2.drawHLine(59, 48 + br, 10); break;
+    case MOOD_SLEEP: { u8g2.drawHLine(28, 35 + br, 26); u8g2.drawHLine(74, 35 + br, 26); int ph = (now / 120) % 18; u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(96 + ph / 4, 26 - ph / 2, "z"); u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(106 + ((ph + 6) % 12) / 3, 20 - ((ph + 6) % 16) / 2, "Z"); break; }
+    case MOOD_THINK: rBox(34, 20, 22, 18, 5); rBox(78, 20, 22, 18, 5); for (int i = 0; i < 3; i++) u8g2.drawDisc(54 + i * 10, 10 - (i == (now / 200) % 3 ? 3 : 0), 2); break;
     case MOOD_CUSTOM: drawCustomFace(br); break;
   }
 
   if (WiFi.status() == WL_CONNECTED) { u8g2.drawPixel(3, 5); u8g2.drawCircle(3, 5, 2, U8G2_DRAW_UPPER_RIGHT); }
-  if (pomoRun && (now / 500) % 2 == 0) u8g2.drawDisc(12, 4, 2);
+  if (autoBrainOn) { u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(10, 7, "AI"); }
+  if (pomoRun && (now / 500) % 2 == 0) u8g2.drawDisc(24, 4, 2);
 
   if (now < toastEnd && toastMsg.length() > 0) {
     u8g2.setFont(u8g2_font_5x7_tf);
@@ -618,27 +628,16 @@ void drawFace() {
   }
 }
 
-// ================= STICKY-NOTE TASK CAROUSEL =================
+// ================= SCREENS & GAMES =================
 void drawTasks() {
-  char r[12]; sprintf(r, "%d/5", taskIdx + 1);
-  drawTopBar("STICKY TASK", r);
+  char r[12]; sprintf(r, "%d/5", taskIdx + 1); drawTopBar("STICKY TASK", r);
   bool done = (taskDoneMask & (1 << taskIdx));
-
-  // Sticky Note Card
-  rFrame(4, 16, 120, 34, 5);
-  u8g2.drawFrame(10, 27, 11, 11);
-  if (done) u8g2.drawBox(12, 29, 7, 7);
-
-  u8g2.setFont(u8g2_font_6x12_tf);
-  String t = tasks[taskIdx].substring(0, 15);
-  u8g2.drawStr(26, 37, t.c_str());
-  if (done) u8g2.drawHLine(26, 33, u8g2.getStrWidth(t.c_str()));
-
-  u8g2.setFont(u8g2_font_5x7_tf);
-  u8g2.drawStr(8, 61, "1x:Check   2x:Next Task");
+  rFrame(4, 16, 120, 34, 5); u8g2.drawFrame(10, 27, 11, 11); if (done) u8g2.drawBox(12, 29, 7, 7);
+  u8g2.setFont(u8g2_font_6x12_tf); String t = tasks[taskIdx].substring(0, 15);
+  u8g2.drawStr(26, 37, t.c_str()); if (done) u8g2.drawHLine(26, 33, u8g2.getStrWidth(t.c_str()));
+  u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(8, 61, "1x:Check   2x:Next Task");
 }
 
-// ================= 4 MINI-GAMES =================
 void startGame(ScreenMode s) {
   currentScreen = s; gState = G_INTRO; lastAct = millis();
   shipLane = 1; astX = 136; astLane = random(0, 3); astSpeed = 3.2f; laserX = -10; scoreSpace = 0;
@@ -661,11 +660,7 @@ void drawSpaceGame() {
   int ly[3] = {22, 38, 54};
   if (gState == G_RUN) {
     astX -= astSpeed;
-    if (laserX >= 0) {
-      laserX += 6;
-      if (laserX > 128) laserX = -10;
-      else if (laserLane == astLane && laserX >= astX) { scoreSpace += 2; laserX = -10; astX = 134; astLane = random(0, 3); if (astSpeed < 6.5f) astSpeed += 0.15f; }
-    }
+    if (laserX >= 0) { laserX += 6; if (laserX > 128) laserX = -10; else if (laserLane == astLane && laserX >= astX) { scoreSpace += 2; laserX = -10; astX = 134; astLane = random(0, 3); if (astSpeed < 6.5f) astSpeed += 0.15f; } }
     if (astX < -10) { astX = 134; astLane = random(0, 3); scoreSpace++; }
     if (astLane == shipLane && astX < 22 && astX + 10 > 10) { gState = G_DEAD; gDeadAt = millis(); if (scoreSpace > hiSpace) { hiSpace = scoreSpace; stateDirty = true; } boostCare(8); }
   }
@@ -694,8 +689,7 @@ void drawFlappyGame() {
 
 void drawPongGame() {
   if (gState == G_RUN) {
-    padY = constrain(padY + padDir, 14.0f, 46.0f);
-    if (padY <= 14.0f || padY >= 46.0f) padDir = -padDir;
+    padY = constrain(padY + padDir, 14.0f, 46.0f); if (padY <= 14.0f || padY >= 46.0f) padDir = -padDir;
     ballX += ballVX; ballY += ballVY;
     if (ballY <= 15 || ballY >= 61) ballVY = -ballVY;
     if (ballX >= 123) ballVX = -fabs(ballVX);
@@ -725,12 +719,10 @@ void drawCatchGame() {
   else if (gState == G_DEAD) { u8g2.setDrawColor(0); rBox(26, 20, 76, 24, 4); u8g2.setDrawColor(1); rFrame(26, 20, 76, 24, 4); u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr(38, 36, "DROPPED!"); }
 }
 
-// ================= DESK APPS =================
 void drawClock() {
   struct tm ti; drawTopBar(dimMode ? "NIGHT" : "CLOCK", "IST");
   if (getLocalTime(&ti, 10)) {
-    char tb[12], db[24], ap[6];
-    strftime(tb, sizeof(tb), "%I:%M", &ti); strftime(ap, sizeof(ap), "%p", &ti); strftime(db, sizeof(db), "%a, %d %b", &ti);
+    char tb[12], db[24], ap[6]; strftime(tb, sizeof(tb), "%I:%M", &ti); strftime(ap, sizeof(ap), "%p", &ti); strftime(db, sizeof(db), "%a, %d %b", &ti);
     u8g2.setFont(u8g2_font_logisoso24_tn); u8g2.drawStr(14, 44, tb);
     u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(98, 34, ap);
     if (!dimMode) { u8g2.drawHLine(16, 49, 96); u8g2.drawStr(32, 61, db); }
@@ -743,10 +735,8 @@ void drawWeather() {
   if (!weatherReady) { u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(14, 38, "Fetching weather..."); return; }
   float t = 0, w = 0; int h = 0;
   if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) { t = wTemp; h = wHum; w = wWind; xSemaphoreGive(netMutex); }
-  char tb[12]; sprintf(tb, "%.1fC", t);
-  u8g2.setFont(u8g2_font_logisoso18_tf); u8g2.drawStr(24, 38, tb);
-  char sb[28]; sprintf(sb, "RH:%d%%   Wind:%.0fkm/h", h, w);
-  u8g2.drawHLine(0, 50, 128); u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(10, 61, sb);
+  char tb[12]; sprintf(tb, "%.1fC", t); u8g2.setFont(u8g2_font_logisoso18_tf); u8g2.drawStr(24, 38, tb);
+  char sb[28]; sprintf(sb, "RH:%d%%   Wind:%.0fkm/h", h, w); u8g2.drawHLine(0, 50, 128); u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(10, 61, sb);
 }
 
 void drawPomo() {
@@ -760,32 +750,27 @@ void drawPomo() {
 
 void drawCounter() {
   drawTopBar(tallyLabel.c_str(), "1x:+1");
-  char b[16]; sprintf(b, "%d", tallyCount);
-  u8g2.setFont(u8g2_font_logisoso24_tn);
+  char b[16]; sprintf(b, "%d", tallyCount); u8g2.setFont(u8g2_font_logisoso24_tn);
   u8g2.drawStr((128 - u8g2.getStrWidth(b)) / 2, 46, b);
   u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(22, 60, "Hold IR: Reset to 0");
 }
 
 void drawDice() {
   drawTopBar("DICE / ORACLE", "1x:Roll");
-  bool rolling = (millis() < diceRollUntil);
-  int showD = rolling ? random(1, 7) : diceVal;
-  rFrame(14, 18, 38, 38, 6);
-  int cx = 33, cy = 37;
+  bool rolling = (millis() < diceRollUntil); int showD = rolling ? random(1, 7) : diceVal;
+  rFrame(14, 18, 38, 38, 6); int cx = 33, cy = 37;
   if (showD % 2 == 1) u8g2.drawDisc(cx, cy, 3);
   if (showD >= 2) { u8g2.drawDisc(cx - 10, cy - 10, 3); u8g2.drawDisc(cx + 10, cy + 10, 3); }
   if (showD >= 4) { u8g2.drawDisc(cx + 10, cy - 10, 3); u8g2.drawDisc(cx - 10, cy + 10, 3); }
   if (showD == 6) { u8g2.drawDisc(cx - 10, cy, 3); u8g2.drawDisc(cx + 10, cy, 3); }
-  rFrame(66, 22, 48, 30, 8);
-  u8g2.setFont(u8g2_font_logisoso16_tf);
+  rFrame(66, 22, 48, 30, 8); u8g2.setFont(u8g2_font_logisoso16_tf);
   const char* ans = rolling ? "..." : (oracleYes ? "YES" : "NO");
   u8g2.drawStr(66 + (48 - u8g2.getStrWidth(ans)) / 2, 44, ans);
 }
 
 void drawBreath() {
   drawTopBar("4-7-8 BREATH", "4x:Home");
-  unsigned long sec = (millis() / 1000) % 19;
-  int r = 6; const char* lbl = "INHALE";
+  unsigned long sec = (millis() / 1000) % 19; int r = 6; const char* lbl = "INHALE";
   if (sec < 4) { r = 6 + (int)((millis() % 19000) * 14 / 4000); lbl = "INHALE 4s"; }
   else if (sec < 11) { r = 20; lbl = "HOLD 7s"; }
   else { r = 20 - (int)(((millis() % 19000) - 11000) * 14 / 8000); lbl = "EXHALE 8s"; }
@@ -795,15 +780,13 @@ void drawBreath() {
 
 void drawBanner() {
   drawTopBar("DESK SIGN", "LIVE");
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr((128 - u8g2.getStrWidth(bannerTop.c_str())) / 2, 33, bannerTop.c_str());
+  u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr((128 - u8g2.getStrWidth(bannerTop.c_str())) / 2, 33, bannerTop.c_str());
   u8g2.drawHLine(16, 39, 96);
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr((128 - u8g2.getStrWidth(bannerSub.c_str())) / 2, 53, bannerSub.c_str());
+  u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr((128 - u8g2.getStrWidth(bannerSub.c_str())) / 2, 53, bannerSub.c_str());
 }
 
 void drawMenu() {
-  drawTopBar("RIDDHI v6.1", "2x:Next");
+  drawTopBar("RIDDHI v6.2", "2x:Next");
   int st = (menuIndex >= 4) ? menuIndex - 3 : 0;
   float targetY = 15.0f + (menuIndex - st) * 12.0f;
   menuScrollY += (targetY - menuScrollY) * 0.35f;
@@ -811,12 +794,9 @@ void drawMenu() {
   u8g2.setFont(u8g2_font_6x10_tf);
   for (int i = 0; i < 4 && (st + i) < MENU_COUNT; i++) {
     int idx = st + i, y = 24 + i * 12;
-    u8g2.setDrawColor(idx == menuIndex ? 0 : 1);
-    u8g2.drawStr(8, y, menuItems[idx]);
+    u8g2.setDrawColor(idx == menuIndex ? 0 : 1); u8g2.drawStr(8, y, menuItems[idx]);
   }
-  u8g2.setDrawColor(1);
-  u8g2.drawVLine(125, 15, 46);
-  rBox(124, 15 + (menuIndex * 36) / (MENU_COUNT - 1), 3, 10, 1);
+  u8g2.setDrawColor(1); u8g2.drawVLine(125, 15, 46); rBox(124, 15 + (menuIndex * 36) / (MENU_COUNT - 1), 3, 10, 1);
 }
 
 void drawWifi() {
@@ -827,23 +807,72 @@ void drawWifi() {
   u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr(3, 55, ("http://" + activeIP).c_str());
 }
 
+// ================= MULTI-ACTION AI EXECUTOR =================
+void executeAiActionPipe(const String& pipeStr) {
+  int st = 0, len = pipeStr.length();
+  while (st < len) {
+    int bar = pipeStr.indexOf('|', st); if (bar < 0) bar = len;
+    String item = pipeStr.substring(st, bar); item.trim();
+    int col = item.indexOf(':');
+    String op = (col > 0) ? item.substring(0, col) : item; op.toUpperCase();
+    String val = (col > 0) ? item.substring(col + 1) : "";
+
+    if (op == "POMO") {
+      int mn = constrain((int)val.toInt(), 1, 99);
+      pomoBreak = false; pomoTotal = (unsigned long)mn * 60000UL; pomoLeft = pomoTotal;
+      pomoRun = true; pomoTick = millis(); pendingScreen = SCR_POMO;
+    } else if (op == "BANNER") {
+      int til = val.indexOf('~');
+      bannerTop = (til >= 0 ? val.substring(0, til) : val).substring(0, 16);
+      bannerSub = (til >= 0 ? val.substring(til + 1) : "AI Sign").substring(0, 20);
+      pendingScreen = SCR_BANNER;
+    } else if (op == "TASK_SET") {
+      int til = val.indexOf('~');
+      if (til > 0) {
+        int idx = constrain((int)val.substring(0, til).toInt(), 0, 4);
+        tasks[idx] = val.substring(til + 1).substring(0, 16);
+        taskDoneMask &= ~(1 << idx); taskIdx = idx; stateDirty = true; pendingScreen = SCR_TASKS;
+      }
+    } else if (op == "TASK_TOG") {
+      int idx = constrain((int)val.toInt(), 0, 4);
+      taskDoneMask ^= (1 << idx); taskIdx = idx; stateDirty = true; boostCare(10); pendingScreen = SCR_TASKS;
+    } else if (op == "TALLY") {
+      tallyCount = (int)val.toInt(); stateDirty = true; pendingScreen = SCR_COUNTER;
+    } else if (op == "DIM") {
+      dimMode = (val.toInt() != 0); u8g2.setContrast(dimMode ? 5 : 255);
+    } else if (op == "FLIP") {
+      flippedDisplay = (val.toInt() != 0); u8g2.setFlipMode(flippedDisplay ? 1 : 0);
+    } else if (op == "HOLIDAY") {
+      manualHoliday = constrain((int)val.toInt(), -1, 5);
+    } else if (op == "CHEER") {
+      boostCare(25);
+    } else if (op == "SCREEN") {
+      val.toUpperCase();
+      if (val == "FACE") pendingScreen = SCR_FACE;
+      else if (val == "TASKS") pendingScreen = SCR_TASKS;
+      else if (val == "CLOCK") pendingScreen = SCR_CLOCK;
+      else if (val == "WEATHER") { fetchWeatherNow = true; pendingScreen = SCR_WEATHER; }
+      else if (val == "POMO") pendingScreen = SCR_POMO;
+      else if (val == "COUNTER") pendingScreen = SCR_COUNTER;
+      else if (val == "DICE") { diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = millis() + 650; pendingScreen = SCR_DICE; }
+      else if (val == "BREATH") pendingScreen = SCR_BREATH;
+      else if (val == "BANNER") pendingScreen = SCR_BANNER;
+      else if (val == "SPACE") { startGame(SCR_SPACE); pendingAt = 0; }
+      else if (val == "FLAPPY") { startGame(SCR_FLAPPY); pendingAt = 0; }
+      else if (val == "PONG") { startGame(SCR_PONG); pendingAt = 0; }
+      else if (val == "CATCH") { startGame(SCR_CATCH); pendingAt = 0; }
+    }
+    st = bar + 1;
+  }
+}
+
 // ================= IR GESTURES =================
 void onGesture(int waves, bool held) {
-  unsigned long now = millis();
-  lastAct = now; pendingAt = 0;
-
-  // Surprised wake-up from Deep Sleep!
+  unsigned long now = millis(); lastAct = now; pendingAt = 0;
   if (wasSleeping && currentScreen == SCR_FACE) {
-    wasSleeping = false;
-    currentMood = MOOD_SHOCKED;
-    tempMoodEnd = now + 700;
-    boostCare(10);
-    toast("Whoa! Awake!", 900);
-    return;
+    wasSleeping = false; currentMood = MOOD_SHOCKED; tempMoodEnd = now + 700; boostCare(10); toast("Whoa! Awake!", 900); return;
   }
-
   if (waves >= 4) { currentScreen = SCR_FACE; currentMood = MOOD_CHILL; toast("Home", 800); return; }
-
   if (held) {
     if (isGame(currentScreen)) { currentScreen = SCR_FACE; gState = G_INTRO; toast("GG!", 1000); }
     else if (currentScreen == SCR_COUNTER) { tallyCount = 0; stateDirty = true; toast("Reset 0", 1000); }
@@ -852,16 +881,11 @@ void onGesture(int waves, bool held) {
     else if (currentScreen == SCR_FACE) { currentMood = MOOD_LOVE; tempMoodEnd = now + 2600; boostCare(25); toast("Cheered Up! <3", 1500); }
     return;
   }
-
   if (waves == 3) {
     if (currentScreen == SCR_MENU) {
-      ScreenMode mapM[] = {
-        SCR_FACE, SCR_TASKS, SCR_CLOCK, SCR_WEATHER, SCR_POMO, SCR_COUNTER, SCR_DICE,
-        SCR_BREATH, SCR_BANNER, SCR_SPACE, SCR_FLAPPY, SCR_PONG, SCR_CATCH, SCR_AI, SCR_WIFI
-      };
+      ScreenMode mapM[] = { SCR_FACE, SCR_TASKS, SCR_CLOCK, SCR_WEATHER, SCR_POMO, SCR_COUNTER, SCR_DICE, SCR_BREATH, SCR_BANNER, SCR_SPACE, SCR_FLAPPY, SCR_PONG, SCR_CATCH, SCR_AI, SCR_WIFI };
       ScreenMode chosen = mapM[menuIndex];
-      if (isGame(chosen)) startGame(chosen);
-      else currentScreen = chosen;
+      if (isGame(chosen)) startGame(chosen); else currentScreen = chosen;
     } else currentScreen = SCR_MENU;
     return;
   }
@@ -880,63 +904,55 @@ void onGesture(int waves, bool held) {
     else if (currentScreen == SCR_WEATHER) { fetchWeatherNow = true; toast("Syncing...", 1000); }
     else if (currentScreen == SCR_POMO) { pomoRun = !pomoRun; pomoTick = now; }
     else if (currentScreen == SCR_MENU) menuIndex = (menuIndex + 1) % MENU_COUNT;
-    else if (currentScreen == SCR_FACE) {
-      boostCare(20);
-      currentMood = MOOD_HYPED; tempMoodEnd = now + 2000;
-      const char* q[] = {"Hey Venu!", "Feeling Good!", "Let's Go!"};
-      toast(q[random(0, 3)], 1200);
-    }
+    else if (currentScreen == SCR_FACE) { boostCare(20); currentMood = MOOD_HYPED; tempMoodEnd = now + 2000; const char* q[] = {"Hey Venu!", "Feeling Good!", "Let's Go!"}; toast(q[random(0, 3)], 1200); }
   }
 }
 
 void pollIR() {
-  unsigned long now = millis();
-  bool raw = (digitalRead(IR_PIN) == LOW);
+  unsigned long now = millis(); bool raw = (digitalRead(IR_PIN) == LOW);
   if (raw != irPrevRaw) { irDebMs = now; irPrevRaw = raw; }
   if (now - irDebMs > 35 && raw != irStable) {
     irStable = raw;
-    if (irStable) {
-      irDownAt = now; irHeld = false;
-      if (isGame(currentScreen)) gameTap();
-    } else if (!irHeld && !isGame(currentScreen)) {
-      irWaves++; irUpAt = now;
-    }
+    if (irStable) { irDownAt = now; irHeld = false; if (isGame(currentScreen)) gameTap(); }
+    else if (!irHeld && !isGame(currentScreen)) { irWaves++; irUpAt = now; }
   }
   if (irStable && !irHeld && (now - irDownAt > 950)) { irHeld = true; irWaves = 0; onGesture(0, true); }
   if (!irStable && irWaves > 0 && (now - irUpAt > 520)) { int c = irWaves; irWaves = 0; onGesture(c, false); }
 }
 
-// ================= 4-TAB CYBER WEB UI (v6.1) =================
+// ================= 4-TAB CYBER WEB UI (v6.2 AI AGENT) =================
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Riddhi v6.1">
-<title>Riddhi OS v6.1</title><style>
-:root{--bg:#090b10;--card:#121622;--btn:#1b2234;--cyan:#22d3ee;--amber:#fbbf24;--emerald:#34d399;--rose:#f43f5e;}
+<meta name="apple-mobile-web-app-title" content="Riddhi AI">
+<title>Riddhi OS v6.2</title><style>
+:root{--bg:#090b10;--card:#121622;--btn:#1b2234;--cyan:#22d3ee;--amber:#fbbf24;--emerald:#34d399;--rose:#f43f5e;--purp:#a855f7;}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:#f1f5f9;margin:0;padding:16px 14px 86px;}
 .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:0 2px;}
 .hdr h2{margin:0;font-size:20px;color:#fff;}
-.badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:99px;background:rgba(34,211,238,.14);color:var(--cyan);border:1px solid rgba(34,211,238,.3);}
+.badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:99px;background:rgba(168,85,247,.16);color:#d8b4fe;border:1px solid rgba(168,85,247,.38);}
 .pg{display:none;}.pg.on{display:block;animation:up .16s ease;}
 @keyframes up{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .box{background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:18px;padding:14px;margin-bottom:12px;}
+.ai-box{border-color:rgba(168,85,247,.38);}
 .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#64748b;margin-bottom:10px;}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
-.row{display:flex;gap:8px;margin-bottom:8px;align-items:center;}
+.row{display:flex;gap:7px;margin-bottom:8px;align-items:center;}
 button{background:var(--btn);color:#e2e8f0;border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:11px 8px;font-size:12.5px;font-weight:600;cursor:pointer;}
 button:active{transform:scale(.96);filter:brightness(1.2);}
 .cy{background:var(--cyan);color:#04131a;border:none;}
 .am{background:var(--amber);color:#1c1102;border:none;}
 .em{background:var(--emerald);color:#022217;border:none;}
+.pu{background:linear-gradient(135deg,#7c3aed,#ec4899);color:#fff;border:none;}
 .ro{background:rgba(244,63,94,.18);border-color:var(--rose);color:#fda4af;}
 .done{background:rgba(52,211,153,.18);border-color:var(--emerald);color:#6ee7b7;text-decoration:line-through;}
 input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#090b10;color:#fff;margin-bottom:8px;font-size:13px;}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;}
-.chip{background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);color:#a5f3fc;padding:6px 11px;border-radius:99px;font-size:11px;font-weight:600;}
-#aiOut{background:#090b10;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px;min-height:48px;font-size:13px;margin-bottom:10px;line-height:1.4;}
+.chip{background:rgba(168,85,247,.14);border:1px solid rgba(168,85,247,.35);color:#e9d5ff;padding:6px 10px;border-radius:99px;font-size:11px;font-weight:600;}
+#aiOut,#bLog{background:#090b10;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:11px;min-height:44px;font-size:12.5px;margin-bottom:10px;line-height:1.4;}
 .gitem{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#090b10;border-radius:13px;margin-bottom:8px;border:1px solid rgba(255,255,255,.06);}
 .gitem b{display:block;font-size:13px;}.gitem span{font-size:11px;color:#64748b;}
 .sub{font-size:11px;color:#64748b;margin-top:6px;}
@@ -950,10 +966,61 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 </style></head><body>
 
 <div id="tst">OK</div>
-<div class="hdr"><h2>Riddhi OS</h2><span class="badge">v6.1 &bull; Alive</span></div>
+<div class="hdr"><h2>Riddhi OS</h2><span class="badge">v6.2 &bull; AI Brain</span></div>
 
-<!-- TAB 1: DESK -->
-<div id="t-desk" class="pg on">
+<!-- TAB 1: AI AGENT & AUTONOMOUS BRAIN -->
+<div id="t-ai" class="pg on">
+  <div class="box ai-box">
+    <div class="lbl">Voice &amp; Multi-Action AI Controller</div>
+    <div id="aiOut">Try: "Start 45m focus timer, set sign to CODING / BUSY, and change task 1 to Revise notes"</div>
+    <div class="chips">
+      <button class="chip" onclick="qAI('Start 25 min timer and set sign to STUDYING / FOCUS')">Study Setup</button>
+      <button class="chip" onclick="qAI('Draw a cool cyber visor face')">Cyber Visor</button>
+      <button class="chip" onclick="qAI('Check off task 1 and cheer up')">Done Task 1</button>
+      <button class="chip" onclick="qAI('Turn on night dim and show clock')">Night Mode</button>
+    </div>
+    <div class="row">
+      <button id="micBtn" style="width:46px" onclick="startMic()">&#127908;</button>
+      <input id="aiIn" style="margin:0;flex:1" placeholder="Speak or type command..." onkeydown="if(event.key==='Enter')runAI()">
+      <button class="pu" style="width:58px" onclick="runAI()">Go</button>
+    </div>
+    <div class="g2">
+      <button id="ttsBtn" style="font-size:11.5px;padding:8px" onclick="togTTS()">Voice Reply: OFF</button>
+      <button style="font-size:11.5px;padding:8px" onclick="togKey()">API Key &amp; Model</button>
+    </div>
+    <div id="kBox" style="display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px">
+      <input id="ak" type="password" placeholder="Paste Google AI Studio API Key">
+      <select id="am">
+        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (Fast &amp; Light)</option>
+        <option value="gemini-2.5-flash">gemini-2.5-flash (Smart)</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+      </select>
+      <button class="cy" style="width:100%" onclick="saveK()">Save Key to Phone + ESP32</button>
+    </div>
+  </div>
+
+  <div class="box">
+    <div class="lbl">Autonomous Core 0 Brain (No Phone Needed)</div>
+    <div id="bLog">Autonomous brain idle.</div>
+    <div class="g2" style="margin-bottom:8px">
+      <button id="brnBtn" onclick="cmd('/brain?tog=1','Brain Toggled!')">Auto Brain: OFF</button>
+      <button class="am" onclick="cmd('/brain?now=1','Riddhi is thinking...')">Think Now</button>
+    </div>
+    <div class="row" style="margin:0">
+      <span style="font-size:12px;color:#94a3b8">Think every:</span>
+      <select id="bInt" style="margin:0;flex:1" onchange="cmd('/brain?int='+this.value,'Interval Saved!')">
+        <option value="10">10 minutes</option>
+        <option value="20" selected>20 minutes</option>
+        <option value="30">30 minutes</option>
+        <option value="60">60 minutes</option>
+      </select>
+    </div>
+    <div class="sub">ESP32 checks time, weather, Care %, and unchecked tasks on Core 0 and acts on its own.</div>
+  </div>
+</div>
+
+<!-- TAB 2: DESK -->
+<div id="t-desk" class="pg">
   <div class="box">
     <div class="lbl">Mood &amp; Care Status (<span id="carePct">90%</span>)</div>
     <div class="sbar"><div id="careBar" class="sfill" style="width:90%"></div></div>
@@ -972,8 +1039,8 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
     </div>
   </div>
   <div class="box">
-    <div class="lbl">Desk Apps</div>
-    <div class="g3">
+    <div class="lbl">Desk Apps &amp; Expressions</div>
+    <div class="g3" style="margin-bottom:8px">
       <button class="cy" onclick="cmd('/scr?s=0','Face')">Face</button>
       <button onclick="cmd('/scr?s=2','Tasks')">Tasks</button>
       <button onclick="cmd('/scr?s=3','Clock')">Clock</button>
@@ -984,23 +1051,17 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
       <button onclick="cmd('/scr?s=8','Breath')">4-7-8</button>
       <button onclick="cmd('/scr?s=9','Sign')">Sign</button>
     </div>
-  </div>
-  <div class="box">
-    <div class="lbl">Micro-Expressions</div>
     <div class="g3">
       <button onclick="cmd('/mood?m=0','Chill')">Chill</button>
       <button class="am" onclick="cmd('/mood?m=1','Hyped')">Hyped</button>
-      <button onclick="cmd('/mood?m=2','Zen')">Zen</button>
-      <button onclick="cmd('/mood?m=3','Grumpy')">Grumpy</button>
-      <button onclick="cmd('/mood?m=5','Side-Eye')">Sus</button>
+      <button onclick="cmd('/mood?m=5','Sus')">Sus</button>
       <button onclick="cmd('/mood?m=6','Smug')">Smug</button>
-      <button onclick="cmd('/mood?m=7','Dizzy')">Dizzy</button>
       <button onclick="cmd('/mood?m=8','Love')">Love</button>
       <button onclick="cmd('/mood?m=11','Sleep')">Sleep</button>
     </div>
   </div>
   <div class="box">
-    <div class="lbl">Desk Sign &amp; Quick Tools</div>
+    <div class="lbl">Desk Sign &amp; Tally</div>
     <input id="bTop" maxlength="16" placeholder="Top line (e.g. FOCUS MODE)">
     <div class="row">
       <input id="bSub" style="margin:0;flex:1" maxlength="20" placeholder="Bottom line (e.g. Do Not Disturb)">
@@ -1013,7 +1074,7 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
   </div>
 </div>
 
-<!-- TAB 2: ARCADE -->
+<!-- TAB 3: ARCADE -->
 <div id="t-play" class="pg">
   <div class="box">
     <div class="lbl">IR Mini-Games</div>
@@ -1029,30 +1090,6 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
       <button onclick="cmd('/g?w=2','2x')">2x Next</button>
       <button onclick="cmd('/g?w=3','3x')">3x Menu / OK</button>
       <button onclick="cmd('/g?w=4','4x')">4x Home</button>
-    </div>
-  </div>
-</div>
-
-<!-- TAB 3: AI -->
-<div id="t-ai" class="pg">
-  <div class="box">
-    <div class="lbl">Gemini AI &amp; Custom Faces</div>
-    <div id="aiOut">Ask anything, control apps, or draw a custom pixel face!</div>
-    <div class="chips">
-      <button class="chip" onclick="qAI('Draw a cool cyber visor face')">Cyber Visor</button>
-      <button class="chip" onclick="qAI('Draw a happy cat face')">Cat Face</button>
-      <button class="chip" onclick="qAI('Start 25 min focus timer')">25m Focus</button>
-      <button class="chip" onclick="qAI('Open sticky tasks')">Tasks</button>
-    </div>
-    <div class="row">
-      <input id="aiIn" style="margin:0;flex:1" placeholder="Command or chat..." onkeydown="if(event.key==='Enter')runAI()">
-      <button class="cy" style="width:64px" onclick="runAI()">Ask</button>
-    </div>
-    <button style="width:100%;font-size:12px;padding:9px" onclick="togKey()">API Key &amp; Model Settings</button>
-    <div id="kBox" style="display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px">
-      <input id="ak" type="password" placeholder="Google AI Studio API Key">
-      <select id="am"><option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Fast)</option><option value="gemini-3.8-flash">gemini-3.8-flash (Smart)</option></select>
-      <button class="cy" style="width:100%" onclick="saveK()">Save Key</button>
     </div>
   </div>
 </div>
@@ -1102,25 +1139,35 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 </div>
 
 <nav>
-  <button class="nb on" onclick="tab('desk',this)"><span>&#9632;</span>Desk</button>
+  <button class="nb on" onclick="tab('ai',this)"><span>&#10024;</span>AI</button>
+  <button class="nb" onclick="tab('desk',this)"><span>&#9632;</span>Desk</button>
   <button class="nb" onclick="tab('play',this)"><span>&#9654;</span>Arcade</button>
-  <button class="nb" onclick="tab('ai',this)"><span>&#10024;</span>AI</button>
   <button class="nb" onclick="tab('sys',this)"><span>&#9881;</span>System</button>
 </nav>
 
 <script>
-let hist=[];
+let hist=[], ttsOn=false;
 const k0=localStorage.getItem('rk')||''; document.getElementById('ak').value=k0;
+if(localStorage.getItem('rm')) document.getElementById('am').value=localStorage.getItem('rm');
 if(!k0) document.getElementById('kBox').style.display='block';
 
 function tab(id,el){
   document.querySelectorAll('.pg').forEach(p=>p.classList.remove('on'));
   document.querySelectorAll('.nb').forEach(b=>b.classList.remove('on'));
   document.getElementById('t-'+id).classList.add('on'); el.classList.add('on');
-  if(id==='desk'||id==='sys') sync();
+  sync();
 }
-function tst(m){const t=document.getElementById('tst');t.innerText=m;t.style.display='block';setTimeout(()=>t.style.display='none',1200);}
-function cmd(u,m){fetch(u);if(m)tst(m);setTimeout(sync,250);}
+function tst(m){const t=document.getElementById('tst');t.innerText=m;t.style.display='block';setTimeout(()=>t.style.display='none',1300);}
+function cmd(u,m){fetch(u);if(m)tst(m);setTimeout(sync,400);}
+function togTTS(){ttsOn=!ttsOn;document.getElementById('ttsBtn').innerText='Voice Reply: '+(ttsOn?'ON':'OFF');}
+function togKey(){const b=document.getElementById('kBox');b.style.display=b.style.display==='none'?'block':'none';}
+function saveK(){
+  const k=document.getElementById('ak').value.trim(), m=document.getElementById('am').value;
+  localStorage.setItem('rk',k); localStorage.setItem('rm',m);
+  document.getElementById('kBox').style.display='none';
+  fetch('/cfg?akey='+encodeURIComponent(k)+'&amod='+encodeURIComponent(m));
+  tst('Saved to Phone & ESP32!');
+}
 function saveTask(){
   const i=document.getElementById('tSlot').value, txt=document.getElementById('tTxt').value.trim();
   if(!txt) return; cmd('/task?i='+i+'&t='+encodeURIComponent(txt),'Task Saved!');
@@ -1129,9 +1176,18 @@ function saveTask(){
 function setBanner(){cmd('/banner?t='+encodeURIComponent(document.getElementById('bTop').value||'FOCUS')+'&s='+encodeURIComponent(document.getElementById('bSub').value||'Riddhi OS'),'Sign Updated!');}
 function saveGh(){cmd('/cfg?gh='+encodeURIComponent(document.getElementById('ghIn').value.trim()),'Repo Saved!');}
 function pullGh(){if(confirm('Download & flash latest Riddhi_OS.ino.bin from GitHub?')) cmd('/ghota','Updating...');}
-function togKey(){const b=document.getElementById('kBox');b.style.display=b.style.display==='none'?'block':'none';}
-function saveK(){localStorage.setItem('rk',document.getElementById('ak').value.trim());localStorage.setItem('rm',document.getElementById('am').value);document.getElementById('kBox').style.display='none';tst('Saved!');}
 function qAI(s){document.getElementById('aiIn').value=s;runAI();}
+
+function startMic(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){tst('Use keyboard mic on iOS/HTTP');return;}
+  const r=new SR(); r.lang='en-IN'; r.interimResults=false;
+  const mb=document.getElementById('micBtn'); mb.style.background='#f43f5e';
+  r.onresult=(e)=>{mb.style.background=''; document.getElementById('aiIn').value=e.results[0][0].transcript; runAI();};
+  r.onerror=()=>{mb.style.background=''; tst('Mic blocked on HTTP - use keyboard mic');};
+  r.onend=()=>{mb.style.background='';};
+  r.start();
+}
 
 async function sync(){
   try{
@@ -1141,6 +1197,10 @@ async function sync(){
     document.getElementById('carePct').innerText=j.care+'%';
     document.getElementById('careBar').style.width=j.care+'%';
     document.getElementById('wFxBtn').innerText='Weather FX: '+(j.wfx?'ON':'OFF');
+    document.getElementById('brnBtn').innerText='Auto Brain: '+(j.brn?'ON':'OFF');
+    document.getElementById('brnBtn').className=j.brn?'em':'';
+    document.getElementById('bInt').value=String(j.bint||20);
+    document.getElementById('bLog').innerText=j.blog||'Autonomous brain idle.';
     if(!document.getElementById('ghIn').value) document.getElementById('ghIn').value=j.gh||'';
     const tl=document.getElementById('tList'); tl.innerHTML='';
     (j.tasks||[]).forEach((t,i)=>{
@@ -1175,7 +1235,7 @@ function upOTA(){
   x.send(fd);
 }
 
-function ser(a){if(!Array.isArray(a))return'';const cl=(v,l,h)=>Math.max(l,Math.min(h,Math.round(+v||0))),o=[];
+function serShapes(a){if(!Array.isArray(a))return'';const cl=(v,l,h)=>Math.max(l,Math.min(h,Math.round(+v||0))),o=[];
 for(const s of a.slice(0,24)){const t=(s.type||'').toLowerCase(),c=(s.c===0)?0:1;
 if(t==='rbox')o.push(`R,${cl(s.x,0,127)},${cl(s.y,0,63)},${cl(s.w,2,128)},${cl(s.h,2,64)},${cl(s.r,0,20)},${c}`);
 else if(t==='disc')o.push(`D,${cl(s.x,0,127)},${cl(s.y,0,63)},${cl(s.r,1,32)},${c}`);
@@ -1183,11 +1243,26 @@ else if(t==='circle')o.push(`C,${cl(s.x,0,127)},${cl(s.y,0,63)},${cl(s.r,1,32)},
 else if(t==='line')o.push(`L,${cl(s.x1,0,127)},${cl(s.y1,0,63)},${cl(s.x2,0,127)},${cl(s.y2,0,63)},${c}`);
 else if(t==='arc')o.push(`A,${cl(s.x,0,127)},${cl(s.y,0,63)},${cl(s.r,1,30)},${s.dir?1:0},${c}`);}return o.join(';');}
 
+function serActs(arr){if(!Array.isArray(arr))return'';const o=[];
+for(const a of arr.slice(0,6)){
+  const op=(a.op||'').toUpperCase();
+  if(op==='POMO') o.push('POMO:'+(a.arg||25));
+  else if(op==='BANNER') o.push('BANNER:'+(a.a||'FOCUS').replace(/[|~]/g,'')+'~'+(a.b||'Riddhi').replace(/[|~]/g,''));
+  else if(op==='TASK_SET') o.push('TASK_SET:'+(a.idx||0)+'~'+(a.text||'Task').replace(/[|~]/g,''));
+  else if(op==='TASK_TOG') o.push('TASK_TOG:'+(a.idx||0));
+  else if(op==='TALLY') o.push('TALLY:'+(a.val||0));
+  else if(op==='DIM') o.push('DIM:'+(a.val?1:0));
+  else if(op==='FLIP') o.push('FLIP:'+(a.val?1:0));
+  else if(op==='HOLIDAY') o.push('HOLIDAY:'+(a.val??-1));
+  else if(op==='CHEER') o.push('CHEER:1');
+  else if(op==='SCREEN') o.push('SCREEN:'+(a.val||'FACE').toUpperCase());
+}return o.join('|');}
+
 async function runAI(){
-  const k=localStorage.getItem('rk')||'', m=localStorage.getItem('rm')||'gemini-3.5-flash-lite', p=document.getElementById('aiIn').value.trim(), out=document.getElementById('aiOut');
-  if(!k){document.getElementById('kBox').style.display='block';out.innerText='Add API Key first.';return;}
-  if(!p)return; document.getElementById('aiIn').value=''; out.innerText='Thinking...'; fetch('/aithink');
-  const sys='You are Riddhi v6.1, a lively ESP32 desk bot (128x64 OLED). Return ONLY JSON: {"mood":"CHILL|HYPED|ZEN|GRUMPY|SHOCKED|SUS|SMUG|DIZZY|LOVE|SLEEP","action":"NONE|CUSTOM_FACE|TASKS|POMO_START|WEATHER|CLOCK|SPACE|FLAPPY|PONG|CATCH|DICE","arg":0,"reply":"ASCII <52 chars","shapes":[]}. For custom faces use action="CUSTOM_FACE" with shapes (rbox,disc,circle,line,arc).';
+  const k=localStorage.getItem('rk')||'', m=localStorage.getItem('rm')||'gemini-2.5-flash-lite', p=document.getElementById('aiIn').value.trim(), out=document.getElementById('aiOut');
+  if(!k){document.getElementById('kBox').style.display='block';out.innerText='Add Gemini API Key first.';return;}
+  if(!p)return; document.getElementById('aiIn').value=''; out.innerText='Executing...'; fetch('/aithink');
+  const sys='You are Riddhi v6.2, an AI-controlled ESP32 desk robot (128x64 OLED). Return ONLY JSON: {"mood":"CHILL|HYPED|ZEN|GRUMPY|SHOCKED|SUS|SMUG|DIZZY|LOVE|SLEEP","reply":"short ASCII <54 chars","shapes":[],"actions":[]}. Supported actions array items: {"op":"POMO","arg":25}, {"op":"BANNER","a":"TOP","b":"SUB"}, {"op":"TASK_SET","idx":0,"text":"Task"}, {"op":"TASK_TOG","idx":0}, {"op":"TALLY","val":10}, {"op":"DIM","val":1}, {"op":"FLIP","val":1}, {"op":"HOLIDAY","val":1}, {"op":"CHEER"}, {"op":"SCREEN","val":"FACE|TASKS|CLOCK|WEATHER|POMO|COUNTER|DICE|BREATH|BANNER|SPACE|FLAPPY|PONG|CATCH"}. For custom faces put primitives (rbox,disc,circle,line,arc) in shapes[].';
   const req=[...hist,{role:'user',parts:[{text:p}]}];
   try{
     const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+m+':generateContent?key='+encodeURIComponent(k),{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1197,10 +1272,15 @@ async function runAI(){
     const j=JSON.parse(d.candidates[0].content.parts[0].text.replace(/^```json|```$/gi,'').trim());
     hist.push({role:'user',parts:[{text:p}]},{role:'model',parts:[{text:j.reply||'OK'}]});
     if(hist.length>6) hist=hist.slice(-6);
-    const mm={CHILL:0,HYPED:1,ZEN:2,GRUMPY:3,SHOCKED:4,SUS:5,SMUG:6,DIZZY:7,LOVE:8,SLEEP:11}; out.innerText=j.reply||'Done!';
-    const b=new URLSearchParams(); b.set('m',mm[(j.mood||'HYPED').toUpperCase()]??1); b.set('act',(j.action||'NONE').toUpperCase()); b.set('arg',j.arg||0); b.set('t',(j.reply||'').replace(/[^\x20-\x7E]/g,'').slice(0,60));
-    const sh=ser(j.shapes); if(sh) b.set('shapes',sh);
+    out.innerText=j.reply||'Done!';
+    const b=new URLSearchParams();
+    b.set('m',(j.mood||'HYPED').toUpperCase());
+    b.set('t',(j.reply||'').replace(/[^\x20-\x7E]/g,'').slice(0,60));
+    const sh=serShapes(j.shapes); if(sh) b.set('shapes',sh);
+    const ac=serActs(j.actions); if(ac) b.set('acts',ac);
     await fetch('/ai',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()});
+    setTimeout(sync,350);
+    if(ttsOn&&'speechSynthesis'in window){window.speechSynthesis.cancel();window.speechSynthesis.speak(new SpeechSynthesisUtterance(j.reply||''));}
   }catch(e){out.innerText='Err: '+e.message; fetch('/mood?m=7');}
 }
 </script></body></html>
@@ -1211,78 +1291,59 @@ void setupWeb() {
 
   server.on("/status", []() {
     String tArr = "[";
-    for (int i = 0; i < 5; i++) {
-      if (i > 0) tArr += ",";
-      tArr += "\"" + jsonEscape(tasks[i]) + "\"";
-    }
+    for (int i = 0; i < 5; i++) { if (i > 0) tArr += ","; tArr += "\"" + jsonEscape(tasks[i]) + "\""; }
     tArr += "]";
+    String logCopy = "";
+    if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(50)) == pdTRUE) { logCopy = lastBrainLog; xSemaphoreGive(netMutex); }
     String j = "{\"cnt\":" + String(tallyCount) + ",\"care\":" + String(careLevel) +
                ",\"wfx\":" + String(weatherFxOn ? 1 : 0) + ",\"tmask\":" + String(taskDoneMask) +
-               ",\"tasks\":" + tArr + ",\"gh\":\"" + jsonEscape(ghRepo) + "\"}";
+               ",\"tasks\":" + tArr + ",\"gh\":\"" + jsonEscape(ghRepo) +
+               "\",\"brn\":" + String(autoBrainOn ? 1 : 0) + ",\"bint\":" + String(brainIntervalMin) +
+               ",\"blog\":\"" + jsonEscape(logCopy) + "\"}";
     server.send(200, "application/json", j);
   });
 
-  server.on("/cheer", []() {
-    boostCare(25); currentScreen = SCR_FACE; currentMood = MOOD_LOVE;
-    tempMoodEnd = millis() + 2600; lastAct = millis(); wasSleeping = false;
-    toast("Thanks! <3", 1500); server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/wfx", []() {
-    weatherFxOn = !weatherFxOn; stateDirty = true;
+  server.on("/brain", []() {
+    if (server.hasArg("tog")) { autoBrainOn = !autoBrainOn; saveNow(); }
+    if (server.hasArg("int")) { brainIntervalMin = constrain((int)server.arg("int").toInt(), 2, 120); saveNow(); }
+    if (server.hasArg("now")) {
+      if (geminiKey.length() < 10) { toast("Save API Key first!", 1800); }
+      else { triggerBrainNow = true; currentScreen = SCR_FACE; currentMood = MOOD_THINK; tempMoodEnd = millis() + 10000; toast("AI Thinking...", 4000); }
+    }
     server.send(200, "text/plain", "OK");
   });
 
-  server.on("/holiday", []() {
-    manualHoliday = server.arg("h").toInt();
-    currentScreen = SCR_FACE; lastAct = millis(); wasSleeping = false;
-    server.send(200, "text/plain", "OK");
+  server.on("/cfg", []() {
+    if (server.hasArg("gh")) ghRepo = server.arg("gh");
+    if (server.hasArg("akey") || server.hasArg("amod")) {
+      if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (server.hasArg("akey")) geminiKey = server.arg("akey");
+        if (server.hasArg("amod")) geminiModel = server.arg("amod");
+        xSemaphoreGive(netMutex);
+      }
+    }
+    saveNow(); server.send(200, "text/plain", "OK");
   });
+
+  server.on("/cheer", []() { boostCare(25); currentScreen = SCR_FACE; currentMood = MOOD_LOVE; tempMoodEnd = millis() + 2600; lastAct = millis(); wasSleeping = false; toast("Thanks! <3", 1500); server.send(200, "text/plain", "OK"); });
+  server.on("/wfx", []() { weatherFxOn = !weatherFxOn; stateDirty = true; server.send(200, "text/plain", "OK"); });
+  server.on("/holiday", []() { manualHoliday = server.arg("h").toInt(); currentScreen = SCR_FACE; lastAct = millis(); wasSleeping = false; server.send(200, "text/plain", "OK"); });
 
   server.on("/task", []() {
-    if (server.hasArg("tog")) {
-      int i = constrain((int)server.arg("tog").toInt(), 0, 4);
-      taskDoneMask ^= (1 << i); taskIdx = i; stateDirty = true; boostCare(8);
-    } else if (server.hasArg("i") && server.hasArg("t")) {
-      int i = constrain((int)server.arg("i").toInt(), 0, 4);
-      tasks[i] = server.arg("t").substring(0, 16);
-      taskDoneMask &= ~(1 << i); taskIdx = i; stateDirty = true;
-    }
-    currentScreen = SCR_TASKS; lastAct = millis();
-    server.send(200, "text/plain", "OK");
+    if (server.hasArg("tog")) { int i = constrain((int)server.arg("tog").toInt(), 0, 4); taskDoneMask ^= (1 << i); taskIdx = i; stateDirty = true; boostCare(8); }
+    else if (server.hasArg("i") && server.hasArg("t")) { int i = constrain((int)server.arg("i").toInt(), 0, 4); tasks[i] = server.arg("t").substring(0, 16); taskDoneMask &= ~(1 << i); taskIdx = i; stateDirty = true; }
+    currentScreen = SCR_TASKS; lastAct = millis(); server.send(200, "text/plain", "OK");
   });
 
-  server.on("/cfg", []() { if (server.hasArg("gh")) ghRepo = server.arg("gh"); saveNow(); server.send(200, "text/plain", "OK"); });
   server.on("/ghota", []() { server.send(200, "text/plain", "OK"); triggerGhOta = true; });
   server.on("/dim", []() { dimMode = !dimMode; u8g2.setContrast(dimMode ? 5 : 255); server.send(200, "text/plain", "OK"); });
   server.on("/flip", []() { flippedDisplay = !flippedDisplay; u8g2.setFlipMode(flippedDisplay ? 1 : 0); server.send(200, "text/plain", "OK"); });
-
-  server.on("/cnt", []() {
-    if (server.hasArg("inc")) tallyCount += server.arg("inc").toInt();
-    if (server.hasArg("reset")) tallyCount = 0;
-    stateDirty = true; currentScreen = SCR_COUNTER; lastAct = millis();
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/dice", []() {
-    currentScreen = SCR_DICE; diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = millis() + 650; lastAct = millis();
-    server.send(200, "text/plain", "OK");
-  });
-
-  server.on("/banner", []() {
-    if (server.hasArg("t")) bannerTop = server.arg("t").substring(0, 16);
-    if (server.hasArg("s")) bannerSub = server.arg("s").substring(0, 20);
-    currentScreen = SCR_BANNER; lastAct = millis();
-    server.send(200, "text/plain", "OK");
-  });
-
+  server.on("/cnt", []() { if (server.hasArg("inc")) tallyCount += server.arg("inc").toInt(); if (server.hasArg("reset")) tallyCount = 0; stateDirty = true; currentScreen = SCR_COUNTER; lastAct = millis(); server.send(200, "text/plain", "OK"); });
+  server.on("/dice", []() { currentScreen = SCR_DICE; diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = millis() + 650; lastAct = millis(); server.send(200, "text/plain", "OK"); });
+  server.on("/banner", []() { if (server.hasArg("t")) bannerTop = server.arg("t").substring(0, 16); if (server.hasArg("s")) bannerSub = server.arg("s").substring(0, 20); currentScreen = SCR_BANNER; lastAct = millis(); server.send(200, "text/plain", "OK"); });
   server.on("/g", []() { onGesture(server.arg("w").toInt(), false); server.send(200, "text/plain", "OK"); });
   server.on("/mood", []() { currentScreen = SCR_FACE; currentMood = (Mood)server.arg("m").toInt(); tempMoodEnd = 0; lastAct = millis(); wasSleeping = false; server.send(200, "text/plain", "OK"); });
-  server.on("/scr", []() {
-    ScreenMode s = (ScreenMode)server.arg("s").toInt();
-    if (isGame(s)) startGame(s); else currentScreen = s;
-    lastAct = millis(); server.send(200, "text/plain", "OK");
-  });
+  server.on("/scr", []() { ScreenMode s = (ScreenMode)server.arg("s").toInt(); if (isGame(s)) startGame(s); else currentScreen = s; lastAct = millis(); server.send(200, "text/plain", "OK"); });
 
   server.on("/update", HTTP_POST, []() {
     server.sendHeader("Connection", "close");
@@ -1299,22 +1360,14 @@ void setupWeb() {
 
   server.on("/aithink", []() { currentScreen = SCR_FACE; currentMood = MOOD_THINK; tempMoodEnd = millis() + 15000; toast("Thinking...", 15000); server.send(200, "text/plain", "OK"); });
   server.on("/ai", HTTP_ANY, []() {
-    int m = constrain((int)server.arg("m").toInt(), 0, 11);
-    String act = server.arg("act"); act.toUpperCase();
-    int argVal = server.arg("arg").toInt();
-    String text = server.arg("t"), shapes = server.arg("shapes");
-    aiReply = text; currentScreen = SCR_FACE; currentMood = (Mood)m; tempMoodEnd = 0; lastAct = millis(); wasSleeping = false;
-    pendingScreen = SCR_AI; pendingAt = millis() + 1400;
-    if (act == "CUSTOM_FACE" || shapes.length() > 0) { parseCustomShapes(shapes); if (customShapeCount > 0) { currentMood = MOOD_CUSTOM; pendingAt = 0; toast(text.substring(0, 20), 2200); } }
-    else if (act == "TASKS") pendingScreen = SCR_TASKS;
-    else if (act == "POMO_START") { int mn = constrain(argVal > 0 ? argVal : 25, 1, 99); pomoBreak = false; pomoTotal = mn * 60000UL; pomoLeft = pomoTotal; pomoRun = true; pomoTick = millis(); pendingScreen = SCR_POMO; }
-    else if (act == "WEATHER") { fetchWeatherNow = true; pendingScreen = SCR_WEATHER; }
-    else if (act == "CLOCK") pendingScreen = SCR_CLOCK;
-    else if (act == "SPACE") { startGame(SCR_SPACE); pendingAt = 0; }
-    else if (act == "FLAPPY") { startGame(SCR_FLAPPY); pendingAt = 0; }
-    else if (act == "PONG") { startGame(SCR_PONG); pendingAt = 0; }
-    else if (act == "CATCH") { startGame(SCR_CATCH); pendingAt = 0; }
-    else if (act == "DICE") pendingScreen = SCR_DICE;
+    String mStr = server.arg("m"), text = server.arg("t"), shapes = server.arg("shapes"), acts = server.arg("acts");
+    aiReply = text; currentScreen = SCR_FACE; currentMood = parseMoodName(mStr); tempMoodEnd = 0; lastAct = millis(); wasSleeping = false;
+    pendingScreen = SCR_AI; pendingAt = millis() + 1500;
+    if (shapes.length() > 0) {
+      parseCustomShapes(shapes);
+      if (customShapeCount > 0) { currentMood = MOOD_CUSTOM; pendingAt = 0; toast(text.substring(0, 20), 2400); }
+    }
+    if (acts.length() > 0) executeAiActionPipe(acts);
     server.send(200, "text/plain", "OK");
   });
 
@@ -1354,11 +1407,12 @@ void setup() {
   }
 
   setupWeb();
-  xTaskCreatePinnedToCore(core0Task, "Core0Net", 4096, NULL, 1, NULL, 0);
+  // 8192-byte stack on Core 0 to safely run TLS HTTPS Gemini calls without blocking Core 1
+  xTaskCreatePinnedToCore(core0Task, "Core0AI", 8192, NULL, 1, NULL, 0);
 
   u8g2.clearBuffer(); drawWifi(); u8g2.sendBuffer(); delay(2400);
   lastAct = millis(); lastSaveMs = millis(); lastCareDecay = millis();
-  toast("Riddhi v6.1 Alive!", 1800);
+  toast("Riddhi v6.2 AI!", 1800);
 }
 
 void loop() {
@@ -1371,13 +1425,27 @@ void loop() {
 
   if (triggerGhOta) { triggerGhOta = false; runGitHubOTA(); }
 
-  // Care / Boredom slow decay
+  // Apply Autonomous Core 0 Brain decisions smoothly on Core 1
+  if (brainHasUpdate && !isGame(currentScreen)) {
+    if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      brainHasUpdate = false;
+      currentMood = parseMoodName(brainMoodStr);
+      tempMoodEnd = now + 8000;
+      lastAct = now; wasSleeping = false;
+      if (brainToastStr.length() > 0) toast(brainToastStr.substring(0, 22), 4000);
+      if (brainBannerT.length() > 0) { bannerTop = brainBannerT.substring(0, 16); bannerSub = brainBannerS.substring(0, 20); }
+      if (brainScrStr == "TASKS") currentScreen = SCR_TASKS;
+      else if (brainScrStr == "BANNER") currentScreen = SCR_BANNER;
+      else currentScreen = SCR_FACE;
+      xSemaphoreGive(netMutex);
+    }
+  }
+
   if (now - lastCareDecay > CARE_DECAY_MS) {
     lastCareDecay = now;
     if (careLevel > 0) { careLevel = max(0, careLevel - 5); stateDirty = true; }
   }
 
-  // Background Pomodoro tick
   if (pomoRun) {
     unsigned long el = now - pomoTick; pomoTick = now;
     if (pomoLeft > el) pomoLeft -= el;
