@@ -28,8 +28,10 @@ const char* AP_PASS = "12345678";
 const char* WEATHER_LAT = "13.5503";
 const char* WEATHER_LON = "78.5029";
 #define GMT_OFFSET_SEC 19800            // IST (UTC +5:30)
-#define SLEEP_TIMEOUT_MS 50000UL
-#define WEATHER_INTERVAL_MS 900000UL
+#define DROWSY_TIMEOUT_MS 35000UL       // Droopy eyes + yawn at 35s
+#define SLEEP_TIMEOUT_MS  50000UL       // Deep sleep at 50s
+#define WEATHER_INTERVAL_MS 900000UL    // 15 mins
+#define CARE_DECAY_MS 1800000UL         // -5% Care every 30 mins idle
 // =====================================================================
 
 WebServer server(80);
@@ -37,30 +39,33 @@ Preferences prefs;
 SemaphoreHandle_t netMutex = NULL;
 
 enum ScreenMode {
-  SCR_FACE = 0, SCR_MENU, SCR_CLOCK, SCR_WEATHER, SCR_POMO,
-  SCR_COUNTER, SCR_DICE, SCR_BREATH, SCR_BANNER,
+  SCR_FACE = 0, SCR_MENU, SCR_TASKS, SCR_CLOCK, SCR_WEATHER,
+  SCR_POMO, SCR_COUNTER, SCR_DICE, SCR_BREATH, SCR_BANNER,
   SCR_SPACE, SCR_FLAPPY, SCR_PONG, SCR_CATCH,
   SCR_AI, SCR_WIFI
 };
 
 enum Mood {
   MOOD_CHILL = 0, MOOD_HYPED, MOOD_ZEN, MOOD_GRUMPY,
-  MOOD_SHOCKED, MOOD_SLEEP, MOOD_THINK, MOOD_CUSTOM
+  MOOD_SHOCKED, MOOD_SUSPICIOUS, MOOD_SMUG, MOOD_DIZZY,
+  MOOD_LOVE, MOOD_SICK, MOOD_DROWSY, MOOD_SLEEP,
+  MOOD_THINK, MOOD_CUSTOM
 };
 
 ScreenMode currentScreen = SCR_FACE;
 Mood currentMood = MOOD_CHILL;
 bool flippedDisplay = false;
 bool dimMode = false;
+bool weatherFxOn = true;
 
-// Quick IR Menu (14 items)
+// Quick IR Menu (15 items)
 const char* menuItems[] = {
-  "Riddhi Face", "Digital Clock", "Live Weather", "Focus Timer",
-  "Tally Counter", "Dice & Oracle", "4-7-8 Breath", "Desk Banner",
-  "Game: Space Def", "Game: Flappy Orb", "Game: Solo Pong", "Game: Orb Catch",
-  "AI Console", "Wi-Fi & Link"
+  "Riddhi Face", "Sticky Tasks", "Digital Clock", "Live Weather",
+  "Focus Timer", "Tally Counter", "Dice & Oracle", "4-7-8 Breath",
+  "Desk Banner", "Game: Space Def", "Game: Flappy Orb", "Game: Solo Pong",
+  "Game: Orb Catch", "AI Console", "Wi-Fi & Link"
 };
-const int MENU_COUNT = 14;
+const int MENU_COUNT = 15;
 int menuIndex = 0;
 float menuScrollY = 15.0f;
 
@@ -69,11 +74,28 @@ struct CustomShape { char type; int p[7]; };
 CustomShape customShapes[24];
 int customShapeCount = 0;
 
-// Eye Animation State
+// Eye Animation & Progressive Sleep State
 float eyeX = 0, eyeTX = 0, eyeY = 0, eyeTY = 0;
 float eyeLH = 24, eyeTLH = 24, eyeRH = 24, eyeTRH = 24;
 unsigned long lastAct = 0, nextBlink = 2200, blinkEnd = 0, nextLook = 2800, tempMoodEnd = 0;
 int blinkPhase = 0;
+bool wasSleeping = false;
+
+// Care / Boredom System
+int careLevel = 90;
+unsigned long lastCareDecay = 0;
+
+// Sticky-Note Task Carousel (5 persistent tasks)
+String tasks[5] = {
+  "Drink water", "Study 45 mins", "Code Riddhi", "Evening walk", "Skincare"
+};
+int taskDoneMask = 0;
+int taskIdx = 0;
+
+// Holiday & Birthday Auto-Surprises (0=None, 1=Bday, 2=NewYear, 3=LoveDay, 4=Halloween, 5=Xmas)
+int autoHoliday = 0;
+int manualHoliday = -1; // -1 = Auto
+int currentHour = 12;
 
 // Persistent Data
 int tallyCount = 0;
@@ -102,32 +124,21 @@ unsigned long diceRollUntil = 0;
 
 // Background Weather (Core 0)
 volatile bool netPaused = false, triggerGhOta = false, fetchWeatherNow = false, weatherReady = false;
-float wTemp = 0, wWind = 0;
-int wHum = 0;
+float wTemp = 26.0f, wWind = 0;
+int wHum = 0, wCode = 0;
 
-// New Games State
+// 4 Mini-Games State
 enum GState { G_INTRO = 0, G_RUN, G_DEAD };
 GState gState = G_INTRO;
 unsigned long gDeadAt = 0;
-
-// 1. Space Defender
-int shipLane = 1; // 0, 1, 2
+int shipLane = 1, astLane = 0, laserX = -10, laserLane = 1, scoreSpace = 0;
 float astX = 132, astSpeed = 3.2f;
-int astLane = 0, laserX = -10, laserLane = 1, scoreSpace = 0;
-
-// 2. Flappy Orb
 float orbY = 32, orbVel = 0, pipeX = 132;
 int pipeGap = 26, scoreFlappy = 0;
-
-// 3. Solo Pong
-float ballX = 64, ballY = 32, ballVX = 2.6f, ballVY = 1.9f;
-float padY = 26, padDir = 2.6f;
+float ballX = 64, ballY = 32, ballVX = 2.6f, ballVY = 1.9f, padY = 26, padDir = 2.6f;
 int scorePong = 0;
-
-// 4. Orb Catch
-int catchSide = 0; // 0 = top-ish/left, 1 = right
+int catchSide = 0, dropSide = 0, scoreCatch = 0;
 float dropY = 14, dropSpeed = 2.4f;
-int dropSide = 0, scoreCatch = 0;
 
 // IR Sensor Engine
 bool irStable = false, irPrevRaw = false, irHeld = false;
@@ -138,7 +149,11 @@ bool isAP = false;
 
 // ================= STORAGE =================
 void saveNow() {
-  prefs.begin("riddhi6", false);
+  prefs.begin("riddhi61", false);
+  prefs.putInt("care", careLevel);
+  prefs.putBool("wFx", weatherFxOn);
+  prefs.putInt("tMask", taskDoneMask);
+  for (int i = 0; i < 5; i++) prefs.putString(("tk" + String(i)).c_str(), tasks[i]);
   prefs.putInt("tCnt", tallyCount);
   prefs.putString("tLbl", tallyLabel);
   prefs.putInt("hiS", hiSpace);
@@ -152,7 +167,14 @@ void saveNow() {
 }
 
 void loadAll() {
-  prefs.begin("riddhi6", true);
+  prefs.begin("riddhi61", true);
+  careLevel    = prefs.getInt("care", 90);
+  weatherFxOn  = prefs.getBool("wFx", true);
+  taskDoneMask = prefs.getInt("tMask", 0);
+  for (int i = 0; i < 5; i++) {
+    String s = prefs.getString(("tk" + String(i)).c_str(), "");
+    if (s.length() > 0) tasks[i] = s;
+  }
   tallyCount = prefs.getInt("tCnt", 0);
   tallyLabel = prefs.getString("tLbl", "COUNT");
   hiSpace    = prefs.getInt("hiS", 0);
@@ -163,8 +185,23 @@ void loadAll() {
   prefs.end();
 }
 
-// ================= UI PRIMITIVES =================
+// ================= HELPERS =================
+String jsonEscape(const String& s) {
+  String out = ""; out.reserve(s.length() + 4);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') out += '\\';
+    if (c >= 0x20) out += c;
+  }
+  return out;
+}
+
 void toast(const String& s, unsigned long ms = 1500) { toastMsg = s; toastEnd = millis() + ms; }
+
+void boostCare(int amt) {
+  careLevel = constrain(careLevel + amt, 0, 100);
+  stateDirty = true;
+}
 
 void rBox(int x, int y, int w, int h, int r) {
   if (w < 2 || h < 2) return;
@@ -173,6 +210,18 @@ void rBox(int x, int y, int w, int h, int r) {
 void rFrame(int x, int y, int w, int h, int r) {
   if (w < 2 || h < 2) return;
   u8g2.drawRFrame(x, y, w, h, max(0, min(r, min(w / 2, h / 2))));
+}
+
+void drawMiniHeart(int x, int y) {
+  u8g2.drawPixel(x - 1, y); u8g2.drawPixel(x + 1, y);
+  u8g2.drawHLine(x - 2, y + 1, 5);
+  u8g2.drawHLine(x - 1, y + 2, 3);
+  u8g2.drawPixel(x, y + 3);
+}
+
+void drawSparkle(int cx, int cy, int s) {
+  u8g2.drawHLine(cx - s, cy, s * 2 + 1);
+  u8g2.drawVLine(cx, cy - s, s * 2 + 1);
 }
 
 void drawTopBar(const char* left, const char* right = "") {
@@ -211,7 +260,7 @@ bool isGame(ScreenMode s) {
 void drawProgress(int pct, const char* msg) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_logisoso18_tf);
-  u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI 6")) / 2, 29, "RIDDHI 6");
+  u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI 6.1")) / 2, 29, "RIDDHI 6.1");
   rFrame(16, 38, 96, 8, 4);
   if (pct > 3) rBox(18, 40, (92 * constrain(pct, 0, 100)) / 100, 4, 2);
   u8g2.setFont(u8g2_font_5x7_tf);
@@ -219,9 +268,8 @@ void drawProgress(int pct, const char* msg) {
   u8g2.sendBuffer();
 }
 
-// ================= BRAND-NEW CYBER-HORIZON BOOT ANIMATION =================
+// ================= CYBER-HORIZON BOOT ANIMATION =================
 void playBootAnimation() {
-  // Stage 1: Horizon laser beam expands from center
   for (int w = 4; w <= 120; w += 12) {
     u8g2.clearBuffer();
     u8g2.drawHLine(64 - w / 2, 32, w);
@@ -229,7 +277,6 @@ void playBootAnimation() {
     u8g2.drawDisc(64 + w / 2, 32, 2);
     u8g2.sendBuffer(); delay(22);
   }
-  // Stage 2: Starburst particles & title reveal
   for (int f = 1; f <= 8; f++) {
     u8g2.clearBuffer();
     int d = f * 5;
@@ -238,10 +285,9 @@ void playBootAnimation() {
     u8g2.setFont(u8g2_font_logisoso16_tf);
     u8g2.drawStr((128 - u8g2.getStrWidth("RIDDHI")) / 2, 36, "RIDDHI");
     u8g2.setFont(u8g2_font_5x7_tf);
-    u8g2.drawStr(46, 50, "OS v6.0");
+    u8g2.drawStr(44, 50, "OS v6.1");
     u8g2.sendBuffer(); delay(55);
   }
-  // Stage 3: Cyber visor eyes open
   for (int h = 2; h <= 24; h += 3) {
     u8g2.clearBuffer();
     rBox(28, 32 - h / 2, 26, h, 5);
@@ -268,14 +314,16 @@ float extractVal(const String& json, const char* key, float fb) {
 void bgWeather() {
   HTTPClient http; http.setTimeout(4000);
   String url = String("http://api.open-meteo.com/v1/forecast?latitude=") + WEATHER_LAT +
-               "&longitude=" + WEATHER_LON + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
+               "&longitude=" + WEATHER_LON +
+               "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m";
   if (http.begin(url) && http.GET() == HTTP_CODE_OK) {
     String p = http.getString();
     float t = extractVal(p, "\"temperature_2m\":", wTemp);
     int h = (int)extractVal(p, "\"relative_humidity_2m\":", wHum);
+    int c = (int)extractVal(p, "\"weather_code\":", wCode);
     float w = extractVal(p, "\"wind_speed_10m\":", wWind);
     if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      wTemp = t; wHum = h; wWind = w; weatherReady = true; xSemaphoreGive(netMutex);
+      wTemp = t; wHum = h; wCode = c; wWind = w; weatherReady = true; xSemaphoreGive(netMutex);
     }
   }
   http.end();
@@ -314,6 +362,25 @@ void runGitHubOTA() {
   }
 }
 
+// ================= HOLIDAY & TIME CHECK =================
+void checkCalendarSurprises() {
+  static unsigned long lastChk = 0;
+  if (millis() - lastChk < 60000UL && lastChk != 0) return;
+  lastChk = millis();
+  struct tm ti;
+  if (!getLocalTime(&ti, 5)) return;
+  currentHour = ti.tm_hour;
+  int m = ti.tm_mon + 1, d = ti.tm_mday;
+  if (m == 10 && d == 4) autoHoliday = 1;       // Birthday (Oct 4)
+  else if (m == 1 && d == 1) autoHoliday = 2;   // New Year
+  else if (m == 2 && d == 14) autoHoliday = 3;  // Valentine's
+  else if (m == 10 && d == 31) autoHoliday = 4; // Halloween
+  else if (m == 12 && d == 25) autoHoliday = 5; // Christmas
+  else autoHoliday = 0;
+}
+
+int getActiveHoliday() { return (manualHoliday >= 0) ? manualHoliday : autoHoliday; }
+
 // ================= CUSTOM AI FACE =================
 void parseCustomShapes(const String& data) {
   customShapeCount = 0; int st = 0, len = data.length();
@@ -351,15 +418,80 @@ void drawCustomFace(int by) {
   u8g2.setDrawColor(1);
 }
 
-// ================= CYBER FACE ENGINE =================
+// ================= WEATHER & HOLIDAY OVERLAYS =================
+void drawWeatherAndHolidayFX(unsigned long now, int& shiverX) {
+  shiverX = 0;
+  int hol = getActiveHoliday();
+
+  // Holiday Overlays
+  if (hol == 1) { // Birthday Cake + Flickering Candle
+    rFrame(106, 48, 16, 12, 2);
+    u8g2.drawHLine(106, 53, 16);
+    u8g2.drawVLine(114, 43, 5);
+    u8g2.drawDisc(114, 41 - ((now / 180) % 2), 1);
+    u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(38, 8, "HBD VENU!");
+  } else if (hol == 2) { // New Year Fireworks
+    int ph = (now / 200) % 2;
+    drawSparkle(14, 16, ph ? 4 : 2); drawSparkle(114, 18, ph ? 2 : 4);
+    drawSparkle(18, 50, ph ? 2 : 3); drawSparkle(110, 50, ph ? 3 : 2);
+    u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(32, 8, "HAPPY NEW YR!");
+  } else if (hol == 3) { // Valentine's Floating Hearts
+    drawMiniHeart(14, 24 - ((now / 120) % 12));
+    drawMiniHeart(114, 28 - ((now / 150) % 12));
+  } else if (hol == 4) { // Halloween Bats/Spooky
+    u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(46, 8, "BOO! ^-^");
+  } else if (hol == 5) { // Christmas Snowfall
+    for (int i = 0; i < 8; i++) {
+      int sx = (i * 17 + 7) % 124;
+      int sy = ((now / 45) + i * 11) % 62;
+      if (sx < 22 || sx > 106) u8g2.drawPixel(sx, sy);
+    }
+  }
+
+  // Live Weather FX (when enabled & loaded)
+  if (!weatherFxOn || !weatherReady) return;
+  int code = 0; float temp = 26.0f;
+  if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(5)) == pdTRUE) { code = wCode; temp = wTemp; xSemaphoreGive(netMutex); }
+
+  if (code >= 51) { // Rain / Drizzle / Storm streaks on edges
+    for (int i = 0; i < 6; i++) {
+      int rx = (i < 3) ? (6 + i * 6) : (106 + (i - 3) * 6);
+      int ry = ((now / 25) + i * 13) % 58;
+      u8g2.drawLine(rx, ry, rx - 2, ry + 5);
+    }
+  } else if (code <= 1 && currentHour >= 7 && currentHour <= 17) { // Sunny Icon top-right
+    u8g2.drawDisc(120, 7, 2);
+    if ((now / 500) % 2 == 0) drawSparkle(120, 7, 4);
+  }
+  if (temp < 18.0f) { // Cold shiver!
+    shiverX = ((now / 90) % 2 == 0) ? -1 : 1;
+  }
+}
+
+// ================= AUTONOMOUS FACE ENGINE =================
 void drawFace() {
   unsigned long now = millis(); float t = now * 0.003f;
-  if (tempMoodEnd > 0 && now > tempMoodEnd) { tempMoodEnd = 0; currentMood = MOOD_CHILL; }
-  if (currentMood == MOOD_CHILL && (now - lastAct > SLEEP_TIMEOUT_MS)) currentMood = MOOD_SLEEP;
+  unsigned long idle = now - lastAct;
+
+  // Temporary mood expiry
+  if (tempMoodEnd > 0 && now > tempMoodEnd) {
+    tempMoodEnd = 0;
+    currentMood = (careLevel < 35) ? MOOD_SICK : MOOD_CHILL;
+  }
+
+  // Progressive Sleep Pipeline: Active -> Drowsy (35s) -> Deep Sleep (50s)
+  if (currentMood == MOOD_CHILL || currentMood == MOOD_SICK || currentMood == MOOD_DROWSY) {
+    if (idle > SLEEP_TIMEOUT_MS) { currentMood = MOOD_SLEEP; wasSleeping = true; }
+    else if (idle > DROWSY_TIMEOUT_MS) { currentMood = MOOD_DROWSY; }
+    else if (currentMood == MOOD_CHILL && careLevel < 35) { currentMood = MOOD_SICK; }
+  }
+
+  int shiverX = 0;
+  drawWeatherAndHolidayFX(now, shiverX);
 
   eyeX += (eyeTX - eyeX) * 0.22f; eyeY += (eyeTY - eyeY) * 0.22f;
   eyeLH += (eyeTLH - eyeLH) * 0.42f; eyeRH += (eyeTRH - eyeRH) * 0.42f;
-  int br = (int)round(sin(t) * 1.4f), ox = (int)round(eyeX), oy = (int)round(eyeY) + br;
+  int br = (int)round(sin(t) * 1.4f), ox = (int)round(eyeX) + shiverX, oy = (int)round(eyeY) + br;
 
   switch (currentMood) {
     case MOOD_CHILL: {
@@ -371,11 +503,17 @@ void drawFace() {
       if (now > nextLook) { eyeTX = random(0, 3) ? random(-10, 11) : 0; eyeTY = random(-4, 5); nextLook = now + random(2200, 4500); }
       int lh = (int)round(eyeLH), rh = (int)round(eyeRH), cy = 29 + oy, lx = 28 + ox, rx = 74 + ox;
       rBox(lx, cy - lh / 2, 26, lh, 5); rBox(rx, cy - rh / 2, 26, rh, 5);
-      u8g2.setDrawColor(0);
-      if (lh > 12) { u8g2.drawBox(lx + 5 + ox / 4, cy - lh / 2 + 5, 5, 5); }
-      if (rh > 12) { u8g2.drawBox(rx + 5 + ox / 4, cy - rh / 2 + 5, 5, 5); }
-      u8g2.setDrawColor(1);
-      u8g2.drawHLine(58 + ox / 2, 46 + oy / 2, 12);
+      // Sunglasses bridge on clear sunny daytime when Weather FX is ON
+      if (weatherFxOn && weatherReady && wCode <= 1 && currentHour >= 9 && currentHour <= 16) {
+        u8g2.drawHLine(lx + 26, cy - 3, rx - (lx + 26));
+        u8g2.drawHLine(lx + 26, cy - 2, rx - (lx + 26));
+      } else {
+        u8g2.setDrawColor(0);
+        if (lh > 12) u8g2.drawBox(lx + 5 + ox / 4, cy - lh / 2 + 5, 5, 5);
+        if (rh > 12) u8g2.drawBox(rx + 5 + ox / 4, cy - rh / 2 + 5, 5, 5);
+        u8g2.setDrawColor(1);
+      }
+      u8g2.drawCircle(64 + ox / 2, 44 + oy / 2, 4, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
       break;
     }
     case MOOD_HYPED: {
@@ -410,6 +548,50 @@ void drawFace() {
       u8g2.drawCircle(64, 49, 4);
       break;
     }
+    case MOOD_SUSPICIOUS: { // Side-eye squint
+      rBox(28, 28, 26, 8, 3); rBox(74, 28, 26, 8, 3);
+      u8g2.setDrawColor(0); u8g2.drawBox(46, 30, 5, 4); u8g2.drawBox(92, 30, 5, 4); u8g2.setDrawColor(1);
+      u8g2.drawLine(56, 48, 72, 46);
+      break;
+    }
+    case MOOD_SMUG: { // Half-lidded grin
+      rBox(28, 24, 26, 16, 5); rBox(74, 24, 26, 16, 5);
+      u8g2.setDrawColor(0); u8g2.drawBox(26, 20, 30, 10); u8g2.drawBox(72, 20, 30, 10); u8g2.setDrawColor(1);
+      u8g2.drawLine(56, 48, 68, 48); u8g2.drawLine(68, 48, 73, 44);
+      break;
+    }
+    case MOOD_DIZZY: {
+      int dx = (int)(cos(t * 3.5f) * 4.5f), dy = (int)(sin(t * 3.5f) * 4.5f);
+      u8g2.drawCircle(41, 30, 12); u8g2.drawDisc(41 + dx, 30 + dy, 4);
+      u8g2.drawCircle(87, 30, 12); u8g2.drawDisc(87 - dx, 30 - dy, 4);
+      u8g2.drawCircle(64, 49, 3);
+      break;
+    }
+    case MOOD_LOVE: {
+      int p = ((now / 280) % 2 == 0) ? 1 : 0, cx[2] = {41, 87};
+      for (int i = 0; i < 2; i++) {
+        u8g2.drawDisc(cx[i] - 5, 27, 6 + p); u8g2.drawDisc(cx[i] + 5, 27, 6 + p);
+        u8g2.drawTriangle(cx[i] - 11 - p, 29, cx[i] + 11 + p, 29, cx[i], 42 + p);
+      }
+      drawMiniHeart(64, 15 - ((now / 110) % 10));
+      u8g2.drawCircle(64, 46, 5, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
+      break;
+    }
+    case MOOD_SICK: { // Bored / Low Care thermometer face
+      rBox(28, 30 + br, 24, 9, 3); rBox(76, 30 + br, 24, 9, 3);
+      u8g2.drawCircle(64, 52, 5, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+      // Little thermometer sticking out of mouth
+      u8g2.drawLine(68, 49, 82, 43); u8g2.drawDisc(83, 43, 2);
+      u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(28, 12, "Bored... Wave!");
+      break;
+    }
+    case MOOD_DROWSY: { // Droopy eyelids + periodic yawn
+      rBox(28, 32 + br, 26, 7, 3); rBox(74, 32 + br, 26, 7, 3);
+      bool yawn = ((now / 1500) % 3 == 0);
+      if (yawn) u8g2.drawCircle(64, 48 + br, 5);
+      else u8g2.drawHLine(59, 48 + br, 10);
+      break;
+    }
     case MOOD_SLEEP: {
       u8g2.drawHLine(28, 35 + br, 26); u8g2.drawHLine(74, 35 + br, 26);
       int ph = (now / 120) % 18;
@@ -436,7 +618,27 @@ void drawFace() {
   }
 }
 
-// ================= 4 BRAND-NEW MINI-GAMES =================
+// ================= STICKY-NOTE TASK CAROUSEL =================
+void drawTasks() {
+  char r[12]; sprintf(r, "%d/5", taskIdx + 1);
+  drawTopBar("STICKY TASK", r);
+  bool done = (taskDoneMask & (1 << taskIdx));
+
+  // Sticky Note Card
+  rFrame(4, 16, 120, 34, 5);
+  u8g2.drawFrame(10, 27, 11, 11);
+  if (done) u8g2.drawBox(12, 29, 7, 7);
+
+  u8g2.setFont(u8g2_font_6x12_tf);
+  String t = tasks[taskIdx].substring(0, 15);
+  u8g2.drawStr(26, 37, t.c_str());
+  if (done) u8g2.drawHLine(26, 33, u8g2.getStrWidth(t.c_str()));
+
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.drawStr(8, 61, "1x:Check   2x:Next Task");
+}
+
+// ================= 4 MINI-GAMES =================
 void startGame(ScreenMode s) {
   currentScreen = s; gState = G_INTRO; lastAct = millis();
   shipLane = 1; astX = 136; astLane = random(0, 3); astSpeed = 3.2f; laserX = -10; scoreSpace = 0;
@@ -447,21 +649,12 @@ void startGame(ScreenMode s) {
 
 void gameTap() {
   unsigned long now = millis(); lastAct = now;
-  if (gState == G_INTRO || (gState == G_DEAD && now - gDeadAt > 450)) {
-    startGame(currentScreen); gState = G_RUN; return;
-  }
+  if (gState == G_INTRO || (gState == G_DEAD && now - gDeadAt > 450)) { startGame(currentScreen); gState = G_RUN; return; }
   if (gState != G_RUN) return;
-
-  if (currentScreen == SCR_SPACE) {
-    shipLane = (shipLane + 1) % 3;
-    if (laserX < 0) { laserX = 22; laserLane = shipLane; }
-  } else if (currentScreen == SCR_FLAPPY) {
-    orbVel = -4.6f;
-  } else if (currentScreen == SCR_PONG) {
-    padDir = -padDir;
-  } else if (currentScreen == SCR_CATCH) {
-    catchSide = 1 - catchSide;
-  }
+  if (currentScreen == SCR_SPACE) { shipLane = (shipLane + 1) % 3; if (laserX < 0) { laserX = 22; laserLane = shipLane; } }
+  else if (currentScreen == SCR_FLAPPY) orbVel = -4.6f;
+  else if (currentScreen == SCR_PONG) padDir = -padDir;
+  else if (currentScreen == SCR_CATCH) catchSide = 1 - catchSide;
 }
 
 void drawSpaceGame() {
@@ -471,24 +664,15 @@ void drawSpaceGame() {
     if (laserX >= 0) {
       laserX += 6;
       if (laserX > 128) laserX = -10;
-      else if (laserLane == astLane && laserX >= astX) {
-        scoreSpace += 2; laserX = -10; astX = 134; astLane = random(0, 3);
-        if (astSpeed < 6.5f) astSpeed += 0.15f;
-      }
+      else if (laserLane == astLane && laserX >= astX) { scoreSpace += 2; laserX = -10; astX = 134; astLane = random(0, 3); if (astSpeed < 6.5f) astSpeed += 0.15f; }
     }
     if (astX < -10) { astX = 134; astLane = random(0, 3); scoreSpace++; }
-    if (astLane == shipLane && astX < 22 && astX + 10 > 10) {
-      gState = G_DEAD; gDeadAt = millis();
-      if (scoreSpace > hiSpace) { hiSpace = scoreSpace; stateDirty = true; }
-    }
+    if (astLane == shipLane && astX < 22 && astX + 10 > 10) { gState = G_DEAD; gDeadAt = millis(); if (scoreSpace > hiSpace) { hiSpace = scoreSpace; stateDirty = true; } boostCare(8); }
   }
   char b[16]; sprintf(b, "HI:%02d SC:%02d", hiSpace, scoreSpace); drawTopBar("SPACE DEF", b);
-  // Starfighter
-  int sy = ly[shipLane];
-  u8g2.drawTriangle(10, sy - 5, 10, sy + 5, 22, sy);
+  int sy = ly[shipLane]; u8g2.drawTriangle(10, sy - 5, 10, sy + 5, 22, sy);
   if (laserX >= 0) u8g2.drawHLine(laserX, ly[laserLane], 6);
   if (gState != G_INTRO) u8g2.drawDisc((int)astX, ly[astLane], 5);
-
   if (gState == G_INTRO) { u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(14, 38, "Wave:Dodge+Fire Hold:Exit"); }
   else if (gState == G_DEAD) { u8g2.setDrawColor(0); rBox(26, 20, 76, 24, 4); u8g2.setDrawColor(1); rFrame(26, 20, 76, 24, 4); u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr(38, 36, "BLASTED!"); }
 }
@@ -498,16 +682,12 @@ void drawFlappyGame() {
     orbVel += 0.42f; orbY += orbVel; pipeX -= 2.6f;
     if (pipeX < -12) { pipeX = 132; pipeGap = random(18, 36); scoreFlappy++; }
     if (orbY < 15 || orbY > 60 || (30 > pipeX && 22 < pipeX + 12 && (orbY - 4 < pipeGap || orbY + 4 > pipeGap + 22))) {
-      gState = G_DEAD; gDeadAt = millis();
-      if (scoreFlappy > hiFlappy) { hiFlappy = scoreFlappy; stateDirty = true; }
+      gState = G_DEAD; gDeadAt = millis(); if (scoreFlappy > hiFlappy) { hiFlappy = scoreFlappy; stateDirty = true; } boostCare(8);
     }
   }
   char b[16]; sprintf(b, "HI:%02d SC:%02d", hiFlappy, scoreFlappy); drawTopBar("FLAPPY ORB", b);
   u8g2.drawDisc(26, (int)orbY, 4);
-  if (gState != G_INTRO) {
-    u8g2.drawBox((int)pipeX, 13, 12, pipeGap - 13);
-    u8g2.drawBox((int)pipeX, pipeGap + 22, 12, 42);
-  }
+  if (gState != G_INTRO) { u8g2.drawBox((int)pipeX, 13, 12, pipeGap - 13); u8g2.drawBox((int)pipeX, pipeGap + 22, 12, 42); }
   if (gState == G_INTRO) { u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(18, 38, "Wave:Flap  Hold:Exit"); }
   else if (gState == G_DEAD) { u8g2.setDrawColor(0); rBox(26, 20, 76, 24, 4); u8g2.setDrawColor(1); rFrame(26, 20, 76, 24, 4); u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr(38, 36, "BONKED!"); }
 }
@@ -518,17 +698,12 @@ void drawPongGame() {
     if (padY <= 14.0f || padY >= 46.0f) padDir = -padDir;
     ballX += ballVX; ballY += ballVY;
     if (ballY <= 15 || ballY >= 61) ballVY = -ballVY;
-    if (ballX >= 123) ballVX = -fabs(ballVX); // Right solid wall
-    if (ballX <= 14 && ballX >= 9 && ballY >= padY - 2 && ballY <= padY + 18) {
-      ballVX = fabs(ballVX) * 1.05f; scorePong++;
-    } else if (ballX < 4) {
-      gState = G_DEAD; gDeadAt = millis();
-      if (scorePong > hiPong) { hiPong = scorePong; stateDirty = true; }
-    }
+    if (ballX >= 123) ballVX = -fabs(ballVX);
+    if (ballX <= 14 && ballX >= 9 && ballY >= padY - 2 && ballY <= padY + 18) { ballVX = fabs(ballVX) * 1.05f; scorePong++; }
+    else if (ballX < 4) { gState = G_DEAD; gDeadAt = millis(); if (scorePong > hiPong) { hiPong = scorePong; stateDirty = true; } boostCare(8); }
   }
   char b[16]; sprintf(b, "HI:%02d SC:%02d", hiPong, scorePong); drawTopBar("SOLO PONG", b);
-  u8g2.drawBox(9, (int)padY, 3, 16);
-  u8g2.drawVLine(125, 13, 51);
+  u8g2.drawBox(9, (int)padY, 3, 16); u8g2.drawVLine(125, 13, 51);
   if (gState != G_INTRO) u8g2.drawDisc((int)ballX, (int)ballY, 2);
   if (gState == G_INTRO) { u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(14, 38, "Wave:Flip Dir  Hold:Exit"); }
   else if (gState == G_DEAD) { u8g2.setDrawColor(0); rBox(26, 20, 76, 24, 4); u8g2.setDrawColor(1); rFrame(26, 20, 76, 24, 4); u8g2.setFont(u8g2_font_6x12_tf); u8g2.drawStr(38, 36, "MISSED!"); }
@@ -539,13 +714,8 @@ void drawCatchGame() {
   if (gState == G_RUN) {
     dropY += dropSpeed;
     if (dropY >= 52) {
-      if (dropSide == catchSide) {
-        scoreCatch++; dropY = 15; dropSide = random(0, 2);
-        if (dropSpeed < 5.5f) dropSpeed += 0.15f;
-      } else {
-        gState = G_DEAD; gDeadAt = millis();
-        if (scoreCatch > hiCatch) { hiCatch = scoreCatch; stateDirty = true; }
-      }
+      if (dropSide == catchSide) { scoreCatch++; dropY = 15; dropSide = random(0, 2); if (dropSpeed < 5.5f) dropSpeed += 0.15f; }
+      else { gState = G_DEAD; gDeadAt = millis(); if (scoreCatch > hiCatch) { hiCatch = scoreCatch; stateDirty = true; } boostCare(8); }
     }
   }
   char b[16]; sprintf(b, "HI:%02d SC:%02d", hiCatch, scoreCatch); drawTopBar("ORB CATCH", b);
@@ -600,14 +770,12 @@ void drawDice() {
   drawTopBar("DICE / ORACLE", "1x:Roll");
   bool rolling = (millis() < diceRollUntil);
   int showD = rolling ? random(1, 7) : diceVal;
-  // Left: Die Box
   rFrame(14, 18, 38, 38, 6);
   int cx = 33, cy = 37;
   if (showD % 2 == 1) u8g2.drawDisc(cx, cy, 3);
   if (showD >= 2) { u8g2.drawDisc(cx - 10, cy - 10, 3); u8g2.drawDisc(cx + 10, cy + 10, 3); }
   if (showD >= 4) { u8g2.drawDisc(cx + 10, cy - 10, 3); u8g2.drawDisc(cx - 10, cy + 10, 3); }
   if (showD == 6) { u8g2.drawDisc(cx - 10, cy, 3); u8g2.drawDisc(cx + 10, cy, 3); }
-  // Right: Oracle Coin
   rFrame(66, 22, 48, 30, 8);
   u8g2.setFont(u8g2_font_logisoso16_tf);
   const char* ans = rolling ? "..." : (oracleYes ? "YES" : "NO");
@@ -621,8 +789,7 @@ void drawBreath() {
   if (sec < 4) { r = 6 + (int)((millis() % 19000) * 14 / 4000); lbl = "INHALE 4s"; }
   else if (sec < 11) { r = 20; lbl = "HOLD 7s"; }
   else { r = 20 - (int)(((millis() % 19000) - 11000) * 14 / 8000); lbl = "EXHALE 8s"; }
-  u8g2.drawCircle(32, 38, constrain(r, 4, 20));
-  u8g2.drawDisc(32, 38, constrain(r - 4, 1, 16));
+  u8g2.drawCircle(32, 38, constrain(r, 4, 20)); u8g2.drawDisc(32, 38, constrain(r - 4, 1, 16));
   u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(60, 41, lbl);
 }
 
@@ -636,7 +803,7 @@ void drawBanner() {
 }
 
 void drawMenu() {
-  drawTopBar("RIDDHI v6.0", "2x:Next");
+  drawTopBar("RIDDHI v6.1", "2x:Next");
   int st = (menuIndex >= 4) ? menuIndex - 3 : 0;
   float targetY = 15.0f + (menuIndex - st) * 12.0f;
   menuScrollY += (targetY - menuScrollY) * 0.35f;
@@ -662,7 +829,19 @@ void drawWifi() {
 
 // ================= IR GESTURES =================
 void onGesture(int waves, bool held) {
-  lastAct = millis(); pendingAt = 0;
+  unsigned long now = millis();
+  lastAct = now; pendingAt = 0;
+
+  // Surprised wake-up from Deep Sleep!
+  if (wasSleeping && currentScreen == SCR_FACE) {
+    wasSleeping = false;
+    currentMood = MOOD_SHOCKED;
+    tempMoodEnd = now + 700;
+    boostCare(10);
+    toast("Whoa! Awake!", 900);
+    return;
+  }
+
   if (waves >= 4) { currentScreen = SCR_FACE; currentMood = MOOD_CHILL; toast("Home", 800); return; }
 
   if (held) {
@@ -670,14 +849,14 @@ void onGesture(int waves, bool held) {
     else if (currentScreen == SCR_COUNTER) { tallyCount = 0; stateDirty = true; toast("Reset 0", 1000); }
     else if (currentScreen == SCR_POMO) { pomoRun = false; pomoBreak = !pomoBreak; pomoTotal = (pomoBreak ? 5UL : 25UL) * 60000UL; pomoLeft = pomoTotal; }
     else if (currentScreen == SCR_WIFI) { WiFi.disconnect(true, true); delay(500); ESP.restart(); }
-    else if (currentScreen == SCR_FACE) { currentMood = MOOD_HYPED; tempMoodEnd = millis() + 2500; toast("Let's Go!", 1400); }
+    else if (currentScreen == SCR_FACE) { currentMood = MOOD_LOVE; tempMoodEnd = now + 2600; boostCare(25); toast("Cheered Up! <3", 1500); }
     return;
   }
 
   if (waves == 3) {
     if (currentScreen == SCR_MENU) {
       ScreenMode mapM[] = {
-        SCR_FACE, SCR_CLOCK, SCR_WEATHER, SCR_POMO, SCR_COUNTER, SCR_DICE,
+        SCR_FACE, SCR_TASKS, SCR_CLOCK, SCR_WEATHER, SCR_POMO, SCR_COUNTER, SCR_DICE,
         SCR_BREATH, SCR_BANNER, SCR_SPACE, SCR_FLAPPY, SCR_PONG, SCR_CATCH, SCR_AI, SCR_WIFI
       };
       ScreenMode chosen = mapM[menuIndex];
@@ -688,20 +867,23 @@ void onGesture(int waves, bool held) {
   }
   if (waves == 2) {
     if (currentScreen == SCR_MENU) menuIndex = (menuIndex + 1) % MENU_COUNT;
-    else if (currentScreen == SCR_FACE) { currentMood = (Mood)(((int)currentMood + 1) % 6); tempMoodEnd = 0; }
+    else if (currentScreen == SCR_TASKS) taskIdx = (taskIdx + 1) % 5;
+    else if (currentScreen == SCR_FACE) { currentMood = (Mood)(((int)currentMood + 1) % 9); tempMoodEnd = 0; }
     else currentScreen = SCR_MENU;
     return;
   }
   if (waves == 1) {
     if (isGame(currentScreen)) gameTap();
+    else if (currentScreen == SCR_TASKS) { taskDoneMask ^= (1 << taskIdx); stateDirty = true; boostCare(10); }
     else if (currentScreen == SCR_COUNTER) { tallyCount++; stateDirty = true; if (tallyCount % 10 == 0) toast("Milestone! " + String(tallyCount), 1600); }
-    else if (currentScreen == SCR_DICE) { diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = millis() + 650; }
+    else if (currentScreen == SCR_DICE) { diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = now + 650; }
     else if (currentScreen == SCR_WEATHER) { fetchWeatherNow = true; toast("Syncing...", 1000); }
-    else if (currentScreen == SCR_POMO) { pomoRun = !pomoRun; pomoTick = millis(); }
+    else if (currentScreen == SCR_POMO) { pomoRun = !pomoRun; pomoTick = now; }
     else if (currentScreen == SCR_MENU) menuIndex = (menuIndex + 1) % MENU_COUNT;
     else if (currentScreen == SCR_FACE) {
-      currentMood = MOOD_HYPED; tempMoodEnd = millis() + 2000;
-      const char* q[] = {"Hey Venu!", "Focus Mode!", "Ready!"};
+      boostCare(20);
+      currentMood = MOOD_HYPED; tempMoodEnd = now + 2000;
+      const char* q[] = {"Hey Venu!", "Feeling Good!", "Let's Go!"};
       toast(q[random(0, 3)], 1200);
     }
   }
@@ -724,41 +906,42 @@ void pollIR() {
   if (!irStable && irWaves > 0 && (now - irUpAt > 520)) { int c = irWaves; irWaves = 0; onGesture(c, false); }
 }
 
-// ================= BRAND-NEW 4-TAB WEB UI =================
+// ================= 4-TAB CYBER WEB UI (v6.1) =================
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Riddhi v6">
-<title>Riddhi OS v6</title><style>
+<meta name="apple-mobile-web-app-title" content="Riddhi v6.1">
+<title>Riddhi OS v6.1</title><style>
 :root{--bg:#090b10;--card:#121622;--btn:#1b2234;--cyan:#22d3ee;--amber:#fbbf24;--emerald:#34d399;--rose:#f43f5e;}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:#f1f5f9;margin:0;padding:16px 14px 86px;}
 .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:0 2px;}
-.hdr h2{margin:0;font-size:20px;letter-spacing:-.4px;color:#fff;}
+.hdr h2{margin:0;font-size:20px;color:#fff;}
 .badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:99px;background:rgba(34,211,238,.14);color:var(--cyan);border:1px solid rgba(34,211,238,.3);}
 .pg{display:none;}.pg.on{display:block;animation:up .16s ease;}
 @keyframes up{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .box{background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:18px;padding:14px;margin-bottom:12px;}
 .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#64748b;margin-bottom:10px;}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;}
-.row{display:flex;gap:8px;margin-bottom:8px;}
-button{background:var(--btn);color:#e2e8f0;border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:12px 8px;font-size:13px;font-weight:600;cursor:pointer;}
+.row{display:flex;gap:8px;margin-bottom:8px;align-items:center;}
+button{background:var(--btn);color:#e2e8f0;border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:11px 8px;font-size:12.5px;font-weight:600;cursor:pointer;}
 button:active{transform:scale(.96);filter:brightness(1.2);}
 .cy{background:var(--cyan);color:#04131a;border:none;}
 .am{background:var(--amber);color:#1c1102;border:none;}
 .em{background:var(--emerald);color:#022217;border:none;}
 .ro{background:rgba(244,63,94,.18);border-color:var(--rose);color:#fda4af;}
-input,select{width:100%;padding:11px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#090b10;color:#fff;margin-bottom:8px;font-size:13px;}
+.done{background:rgba(52,211,153,.18);border-color:var(--emerald);color:#6ee7b7;text-decoration:line-through;}
+input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#090b10;color:#fff;margin-bottom:8px;font-size:13px;}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;}
 .chip{background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);color:#a5f3fc;padding:6px 11px;border-radius:99px;font-size:11px;font-weight:600;}
 #aiOut{background:#090b10;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px;min-height:48px;font-size:13px;margin-bottom:10px;line-height:1.4;}
 .gitem{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:#090b10;border-radius:13px;margin-bottom:8px;border:1px solid rgba(255,255,255,.06);}
 .gitem b{display:block;font-size:13px;}.gitem span{font-size:11px;color:#64748b;}
 .sub{font-size:11px;color:#64748b;margin-top:6px;}
-.sbar{width:100%;height:6px;background:#090b10;border-radius:6px;overflow:hidden;margin-top:8px;}
-.sfill{height:100%;background:var(--cyan);transition:width .2s;}
+.sbar{width:100%;height:7px;background:#090b10;border-radius:6px;overflow:hidden;margin:6px 0 10px;}
+.sfill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--emerald));transition:width .25s;}
 nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop-filter:blur(10px);border-top:1px solid rgba(255,255,255,.08);display:flex;justify-content:space-around;padding:8px 4px 12px;}
 .nb{background:none;border:none;color:#64748b;font-size:11px;display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 12px;border-radius:12px;}
 .nb.on{color:var(--cyan);background:rgba(34,211,238,.12);}
@@ -767,45 +950,65 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 </style></head><body>
 
 <div id="tst">OK</div>
-<div class="hdr"><h2>Riddhi OS</h2><span class="badge">v6.0 &bull; ESP32</span></div>
+<div class="hdr"><h2>Riddhi OS</h2><span class="badge">v6.1 &bull; Alive</span></div>
 
 <!-- TAB 1: DESK -->
 <div id="t-desk" class="pg on">
   <div class="box">
-    <div class="lbl">Screens &amp; Desk Tools</div>
-    <div class="g3">
-      <button class="cy" onclick="cmd('/scr?s=0','Face')">Face</button>
-      <button onclick="cmd('/scr?s=2','Clock')">Clock</button>
-      <button onclick="cmd('/scr?s=3','Weather')">Weather</button>
-      <button onclick="cmd('/scr?s=4','Timer')">Timer</button>
-      <button onclick="cmd('/scr?s=5','Counter')">Counter</button>
-      <button onclick="cmd('/scr?s=6','Dice')">Dice</button>
-      <button onclick="cmd('/scr?s=7','Breath')">4-7-8 Zen</button>
-      <button onclick="cmd('/scr?s=8','Sign')">Desk Sign</button>
-      <button onclick="cmd('/dim','Dimmed')">Night Dim</button>
+    <div class="lbl">Mood &amp; Care Status (<span id="carePct">90%</span>)</div>
+    <div class="sbar"><div id="careBar" class="sfill" style="width:90%"></div></div>
+    <div class="g2">
+      <button class="em" onclick="cmd('/cheer','Cheered Up!')">Cheer Up (+25%)</button>
+      <button id="wFxBtn" onclick="cmd('/wfx','Weather FX Toggled')">Weather FX: ON</button>
     </div>
   </div>
   <div class="box">
-    <div class="lbl">Expressions</div>
+    <div class="lbl">Sticky-Note Task Carousel (Tap to Check)</div>
+    <div id="tList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>
+    <div class="row" style="margin:0">
+      <select id="tSlot" style="width:66px;margin:0"><option value="0">#1</option><option value="1">#2</option><option value="2">#3</option><option value="3">#4</option><option value="4">#5</option></select>
+      <input id="tTxt" style="margin:0;flex:1" maxlength="16" placeholder="Edit task text...">
+      <button class="cy" style="width:60px" onclick="saveTask()">Set</button>
+    </div>
+  </div>
+  <div class="box">
+    <div class="lbl">Desk Apps</div>
+    <div class="g3">
+      <button class="cy" onclick="cmd('/scr?s=0','Face')">Face</button>
+      <button onclick="cmd('/scr?s=2','Tasks')">Tasks</button>
+      <button onclick="cmd('/scr?s=3','Clock')">Clock</button>
+      <button onclick="cmd('/scr?s=4','Weather')">Weather</button>
+      <button onclick="cmd('/scr?s=5','Timer')">Timer</button>
+      <button onclick="cmd('/scr?s=6','Counter')">Counter</button>
+      <button onclick="cmd('/scr?s=7','Dice')">Dice</button>
+      <button onclick="cmd('/scr?s=8','Breath')">4-7-8</button>
+      <button onclick="cmd('/scr?s=9','Sign')">Sign</button>
+    </div>
+  </div>
+  <div class="box">
+    <div class="lbl">Micro-Expressions</div>
     <div class="g3">
       <button onclick="cmd('/mood?m=0','Chill')">Chill</button>
       <button class="am" onclick="cmd('/mood?m=1','Hyped')">Hyped</button>
       <button onclick="cmd('/mood?m=2','Zen')">Zen</button>
       <button onclick="cmd('/mood?m=3','Grumpy')">Grumpy</button>
-      <button onclick="cmd('/mood?m=4','Shocked')">Shocked</button>
-      <button onclick="cmd('/mood?m=5','Sleep')">Sleep</button>
+      <button onclick="cmd('/mood?m=5','Side-Eye')">Sus</button>
+      <button onclick="cmd('/mood?m=6','Smug')">Smug</button>
+      <button onclick="cmd('/mood?m=7','Dizzy')">Dizzy</button>
+      <button onclick="cmd('/mood?m=8','Love')">Love</button>
+      <button onclick="cmd('/mood?m=11','Sleep')">Sleep</button>
     </div>
   </div>
   <div class="box">
-    <div class="lbl">Live Desk Sign &amp; Tally</div>
+    <div class="lbl">Desk Sign &amp; Quick Tools</div>
     <input id="bTop" maxlength="16" placeholder="Top line (e.g. FOCUS MODE)">
     <div class="row">
       <input id="bSub" style="margin:0;flex:1" maxlength="20" placeholder="Bottom line (e.g. Do Not Disturb)">
-      <button class="cy" style="width:74px" onclick="setBanner()">Show</button>
+      <button class="cy" style="width:66px" onclick="setBanner()">Show</button>
     </div>
-    <div class="g2" style="margin-top:8px">
+    <div class="g2">
       <button class="em" onclick="cmd('/cnt?inc=1','+1!')">Tally +1 (<span id="cVal">0</span>)</button>
-      <button onclick="cmd('/dice','Rolled!')">Roll Dice &amp; Oracle</button>
+      <button onclick="cmd('/dice','Rolled!')">Roll Dice</button>
     </div>
   </div>
 </div>
@@ -813,16 +1016,16 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 <!-- TAB 2: ARCADE -->
 <div id="t-play" class="pg">
   <div class="box">
-    <div class="lbl">New IR Mini-Games</div>
-    <div class="gitem"><div><b>Space Defender</b><span>Wave to switch lanes &amp; blast asteroids</span></div><button class="em" style="width:68px" onclick="cmd('/scr?s=9','Space!')">Play</button></div>
-    <div class="gitem"><div><b>Flappy Orb</b><span>Wave to flap through neon pillars</span></div><button class="em" style="width:68px" onclick="cmd('/scr?s=10','Flappy!')">Play</button></div>
-    <div class="gitem"><div><b>Solo Pong</b><span>Wave to reverse paddle direction</span></div><button class="em" style="width:68px" onclick="cmd('/scr?s=11','Pong!')">Play</button></div>
-    <div class="gitem" style="margin:0"><div><b>Orb Catch</b><span>Wave to toggle left/right catcher</span></div><button class="em" style="width:68px" onclick="cmd('/scr?s=12','Catch!')">Play</button></div>
+    <div class="lbl">IR Mini-Games</div>
+    <div class="gitem"><div><b>Space Defender</b><span>Wave to switch lanes &amp; blast asteroids</span></div><button class="em" style="width:66px" onclick="cmd('/scr?s=10','Space!')">Play</button></div>
+    <div class="gitem"><div><b>Flappy Orb</b><span>Wave to flap through neon pillars</span></div><button class="em" style="width:66px" onclick="cmd('/scr?s=11','Flappy!')">Play</button></div>
+    <div class="gitem"><div><b>Solo Pong</b><span>Wave to reverse paddle direction</span></div><button class="em" style="width:66px" onclick="cmd('/scr?s=12','Pong!')">Play</button></div>
+    <div class="gitem" style="margin:0"><div><b>Orb Catch</b><span>Wave to toggle left/right catcher</span></div><button class="em" style="width:66px" onclick="cmd('/scr?s=13','Catch!')">Play</button></div>
   </div>
   <div class="box">
-    <div class="lbl">Virtual IR Controller</div>
+    <div class="lbl">Virtual IR Remote</div>
     <div class="g2">
-      <button class="cy" onclick="cmd('/g?w=1','1x')">1x Action / Tap</button>
+      <button class="cy" onclick="cmd('/g?w=1','1x')">1x Action / Check</button>
       <button onclick="cmd('/g?w=2','2x')">2x Next</button>
       <button onclick="cmd('/g?w=3','3x')">3x Menu / OK</button>
       <button onclick="cmd('/g?w=4','4x')">4x Home</button>
@@ -833,17 +1036,17 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 <!-- TAB 3: AI -->
 <div id="t-ai" class="pg">
   <div class="box">
-    <div class="lbl">Gemini AI &amp; Custom OLED Faces</div>
+    <div class="lbl">Gemini AI &amp; Custom Faces</div>
     <div id="aiOut">Ask anything, control apps, or draw a custom pixel face!</div>
     <div class="chips">
       <button class="chip" onclick="qAI('Draw a cool cyber visor face')">Cyber Visor</button>
       <button class="chip" onclick="qAI('Draw a happy cat face')">Cat Face</button>
       <button class="chip" onclick="qAI('Start 25 min focus timer')">25m Focus</button>
-      <button class="chip" onclick="qAI('Open weather')">Weather</button>
+      <button class="chip" onclick="qAI('Open sticky tasks')">Tasks</button>
     </div>
     <div class="row">
-      <input id="aiIn" style="margin:0;flex:1" placeholder="Command or chat with Riddhi..." onkeydown="if(event.key==='Enter')runAI()">
-      <button class="cy" style="width:66px" onclick="runAI()">Ask</button>
+      <input id="aiIn" style="margin:0;flex:1" placeholder="Command or chat..." onkeydown="if(event.key==='Enter')runAI()">
+      <button class="cy" style="width:64px" onclick="runAI()">Ask</button>
     </div>
     <button style="width:100%;font-size:12px;padding:9px" onclick="togKey()">API Key &amp; Model Settings</button>
     <div id="kBox" style="display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px">
@@ -856,6 +1059,18 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 
 <!-- TAB 4: SYSTEM -->
 <div id="t-sys" class="pg">
+  <div class="box">
+    <div class="lbl">Holiday &amp; Birthday Preview</div>
+    <select id="holSel" onchange="cmd('/holiday?h='+this.value,'Updated!')">
+      <option value="-1">Auto (By Calendar Date)</option>
+      <option value="1">Preview: Birthday Cake (Oct 4)</option>
+      <option value="2">Preview: New Year Fireworks</option>
+      <option value="3">Preview: Floating Hearts</option>
+      <option value="4">Preview: Spooky Halloween</option>
+      <option value="5">Preview: Christmas Snow</option>
+      <option value="0">Off</option>
+    </select>
+  </div>
   <div class="box">
     <div class="lbl">1-Tap GitHub Releases Update</div>
     <input id="ghIn" placeholder="Public repo (e.g. yourname/Riddhi)">
@@ -872,15 +1087,16 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
     <div id="oSt" class="sub"></div>
   </div>
   <div class="box">
-    <div class="lbl">Wi-Fi &amp; Orientation</div>
+    <div class="lbl">Wi-Fi &amp; Display</div>
     <button style="width:100%;margin-bottom:8px" onclick="scanW()">Scan 2.4GHz Networks</button>
     <div id="wList" class="chips"></div>
     <input id="ssid" placeholder="Wi-Fi SSID"><input id="pass" type="password" placeholder="Wi-Fi Password">
     <div class="g3">
       <button class="cy" onclick="saveW()">Save</button>
-      <button onclick="cmd('/flip','Flipped!')">Flip OLED</button>
-      <button class="ro" onclick="cmd('/resetwifi','Resetting')">Reset</button>
+      <button onclick="cmd('/flip','Flipped!')">Flip</button>
+      <button onclick="cmd('/dim','Dimmed')">Dim</button>
     </div>
+    <button class="ro" style="width:100%;margin-top:8px" onclick="cmd('/resetwifi','Resetting')">Reset Wi-Fi</button>
     <div id="wSt" class="sub"></div>
   </div>
 </div>
@@ -905,6 +1121,11 @@ function tab(id,el){
 }
 function tst(m){const t=document.getElementById('tst');t.innerText=m;t.style.display='block';setTimeout(()=>t.style.display='none',1200);}
 function cmd(u,m){fetch(u);if(m)tst(m);setTimeout(sync,250);}
+function saveTask(){
+  const i=document.getElementById('tSlot').value, txt=document.getElementById('tTxt').value.trim();
+  if(!txt) return; cmd('/task?i='+i+'&t='+encodeURIComponent(txt),'Task Saved!');
+  document.getElementById('tTxt').value='';
+}
 function setBanner(){cmd('/banner?t='+encodeURIComponent(document.getElementById('bTop').value||'FOCUS')+'&s='+encodeURIComponent(document.getElementById('bSub').value||'Riddhi OS'),'Sign Updated!');}
 function saveGh(){cmd('/cfg?gh='+encodeURIComponent(document.getElementById('ghIn').value.trim()),'Repo Saved!');}
 function pullGh(){if(confirm('Download & flash latest Riddhi_OS.ino.bin from GitHub?')) cmd('/ghota','Updating...');}
@@ -917,7 +1138,19 @@ async function sync(){
     const r=await fetch('/status'); if(!r.ok) return;
     const j=await r.json();
     document.getElementById('cVal').innerText=j.cnt;
+    document.getElementById('carePct').innerText=j.care+'%';
+    document.getElementById('careBar').style.width=j.care+'%';
+    document.getElementById('wFxBtn').innerText='Weather FX: '+(j.wfx?'ON':'OFF');
     if(!document.getElementById('ghIn').value) document.getElementById('ghIn').value=j.gh||'';
+    const tl=document.getElementById('tList'); tl.innerHTML='';
+    (j.tasks||[]).forEach((t,i)=>{
+      const b=document.createElement('button');
+      const dn=(j.tmask&(1<<i))!==0;
+      b.className=dn?'done':''; b.style.textAlign='left';
+      b.innerText=(dn?'[x] ':'[ ] ')+(i+1)+'. '+t;
+      b.onclick=()=>cmd('/task?tog='+i,'Toggled!');
+      tl.appendChild(b);
+    });
   }catch(e){}
 }
 sync();
@@ -954,7 +1187,7 @@ async function runAI(){
   const k=localStorage.getItem('rk')||'', m=localStorage.getItem('rm')||'gemini-3.5-flash-lite', p=document.getElementById('aiIn').value.trim(), out=document.getElementById('aiOut');
   if(!k){document.getElementById('kBox').style.display='block';out.innerText='Add API Key first.';return;}
   if(!p)return; document.getElementById('aiIn').value=''; out.innerText='Thinking...'; fetch('/aithink');
-  const sys='You are Riddhi v6, a witty cyber ESP32 desk bot (128x64 OLED). Return ONLY JSON: {"mood":"CHILL|HYPED|ZEN|GRUMPY|SHOCKED|SLEEP","action":"NONE|CUSTOM_FACE|POMO_START|WEATHER|CLOCK|SPACE|FLAPPY|PONG|CATCH|DICE","arg":0,"reply":"ASCII <52 chars","shapes":[]}. For custom faces use action="CUSTOM_FACE" with shapes (rbox,disc,circle,line,arc).';
+  const sys='You are Riddhi v6.1, a lively ESP32 desk bot (128x64 OLED). Return ONLY JSON: {"mood":"CHILL|HYPED|ZEN|GRUMPY|SHOCKED|SUS|SMUG|DIZZY|LOVE|SLEEP","action":"NONE|CUSTOM_FACE|TASKS|POMO_START|WEATHER|CLOCK|SPACE|FLAPPY|PONG|CATCH|DICE","arg":0,"reply":"ASCII <52 chars","shapes":[]}. For custom faces use action="CUSTOM_FACE" with shapes (rbox,disc,circle,line,arc).';
   const req=[...hist,{role:'user',parts:[{text:p}]}];
   try{
     const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+m+':generateContent?key='+encodeURIComponent(k),{method:'POST',headers:{'Content-Type':'application/json'},
@@ -964,11 +1197,11 @@ async function runAI(){
     const j=JSON.parse(d.candidates[0].content.parts[0].text.replace(/^```json|```$/gi,'').trim());
     hist.push({role:'user',parts:[{text:p}]},{role:'model',parts:[{text:j.reply||'OK'}]});
     if(hist.length>6) hist=hist.slice(-6);
-    const mm={CHILL:0,HYPED:1,ZEN:2,GRUMPY:3,SHOCKED:4,SLEEP:5}; out.innerText=j.reply||'Done!';
+    const mm={CHILL:0,HYPED:1,ZEN:2,GRUMPY:3,SHOCKED:4,SUS:5,SMUG:6,DIZZY:7,LOVE:8,SLEEP:11}; out.innerText=j.reply||'Done!';
     const b=new URLSearchParams(); b.set('m',mm[(j.mood||'HYPED').toUpperCase()]??1); b.set('act',(j.action||'NONE').toUpperCase()); b.set('arg',j.arg||0); b.set('t',(j.reply||'').replace(/[^\x20-\x7E]/g,'').slice(0,60));
     const sh=ser(j.shapes); if(sh) b.set('shapes',sh);
     await fetch('/ai',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()});
-  }catch(e){out.innerText='Err: '+e.message; fetch('/mood?m=4');}
+  }catch(e){out.innerText='Err: '+e.message; fetch('/mood?m=7');}
 }
 </script></body></html>
 )rawliteral";
@@ -977,15 +1210,49 @@ void setupWeb() {
   server.on("/", []() { server.send_P(200, "text/html", HTML_PAGE); });
 
   server.on("/status", []() {
-    String j = "{\"cnt\":" + String(tallyCount) + ",\"gh\":\"" + ghRepo + "\"}";
+    String tArr = "[";
+    for (int i = 0; i < 5; i++) {
+      if (i > 0) tArr += ",";
+      tArr += "\"" + jsonEscape(tasks[i]) + "\"";
+    }
+    tArr += "]";
+    String j = "{\"cnt\":" + String(tallyCount) + ",\"care\":" + String(careLevel) +
+               ",\"wfx\":" + String(weatherFxOn ? 1 : 0) + ",\"tmask\":" + String(taskDoneMask) +
+               ",\"tasks\":" + tArr + ",\"gh\":\"" + jsonEscape(ghRepo) + "\"}";
     server.send(200, "application/json", j);
   });
 
-  server.on("/cfg", []() {
-    if (server.hasArg("gh")) ghRepo = server.arg("gh");
-    saveNow(); server.send(200, "text/plain", "OK");
+  server.on("/cheer", []() {
+    boostCare(25); currentScreen = SCR_FACE; currentMood = MOOD_LOVE;
+    tempMoodEnd = millis() + 2600; lastAct = millis(); wasSleeping = false;
+    toast("Thanks! <3", 1500); server.send(200, "text/plain", "OK");
   });
 
+  server.on("/wfx", []() {
+    weatherFxOn = !weatherFxOn; stateDirty = true;
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/holiday", []() {
+    manualHoliday = server.arg("h").toInt();
+    currentScreen = SCR_FACE; lastAct = millis(); wasSleeping = false;
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/task", []() {
+    if (server.hasArg("tog")) {
+      int i = constrain((int)server.arg("tog").toInt(), 0, 4);
+      taskDoneMask ^= (1 << i); taskIdx = i; stateDirty = true; boostCare(8);
+    } else if (server.hasArg("i") && server.hasArg("t")) {
+      int i = constrain((int)server.arg("i").toInt(), 0, 4);
+      tasks[i] = server.arg("t").substring(0, 16);
+      taskDoneMask &= ~(1 << i); taskIdx = i; stateDirty = true;
+    }
+    currentScreen = SCR_TASKS; lastAct = millis();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/cfg", []() { if (server.hasArg("gh")) ghRepo = server.arg("gh"); saveNow(); server.send(200, "text/plain", "OK"); });
   server.on("/ghota", []() { server.send(200, "text/plain", "OK"); triggerGhOta = true; });
   server.on("/dim", []() { dimMode = !dimMode; u8g2.setContrast(dimMode ? 5 : 255); server.send(200, "text/plain", "OK"); });
   server.on("/flip", []() { flippedDisplay = !flippedDisplay; u8g2.setFlipMode(flippedDisplay ? 1 : 0); server.send(200, "text/plain", "OK"); });
@@ -1010,7 +1277,7 @@ void setupWeb() {
   });
 
   server.on("/g", []() { onGesture(server.arg("w").toInt(), false); server.send(200, "text/plain", "OK"); });
-  server.on("/mood", []() { currentScreen = SCR_FACE; currentMood = (Mood)server.arg("m").toInt(); tempMoodEnd = 0; lastAct = millis(); server.send(200, "text/plain", "OK"); });
+  server.on("/mood", []() { currentScreen = SCR_FACE; currentMood = (Mood)server.arg("m").toInt(); tempMoodEnd = 0; lastAct = millis(); wasSleeping = false; server.send(200, "text/plain", "OK"); });
   server.on("/scr", []() {
     ScreenMode s = (ScreenMode)server.arg("s").toInt();
     if (isGame(s)) startGame(s); else currentScreen = s;
@@ -1026,19 +1293,20 @@ void setupWeb() {
     if (up.status == UPLOAD_FILE_START) { netPaused = true; if (stateDirty) saveNow(); drawProgress(5, "Starting OTA..."); Update.begin(UPDATE_SIZE_UNKNOWN); }
     else if (up.status == UPLOAD_FILE_WRITE) {
       Update.write(up.buf, up.currentSize);
-      if (millis() - ld > 180) { ld = millis(); char b[24]; sprintf(b, "Flashing %d KB...", up.totalSize / 1024); drawProgress(constrain((up.totalSize / 1024) * 100 / 1150, 8, 96), b); }
+      if (millis() - ld > 180) { ld = millis(); char b[24]; sprintf(b, "Flashing %d KB...", up.totalSize / 1024); drawProgress(constrain((int)((up.totalSize / 1024) * 100 / 1150), 8, 96), b); }
     } else if (up.status == UPLOAD_FILE_END) { drawProgress(Update.end(true) ? 100 : 0, Update.hasError() ? "OTA Failed!" : "Rebooting..."); if (Update.hasError()) netPaused = false; }
   });
 
   server.on("/aithink", []() { currentScreen = SCR_FACE; currentMood = MOOD_THINK; tempMoodEnd = millis() + 15000; toast("Thinking...", 15000); server.send(200, "text/plain", "OK"); });
   server.on("/ai", HTTP_ANY, []() {
-    int m = constrain(server.arg("m").toInt(), 0, 5);
+    int m = constrain((int)server.arg("m").toInt(), 0, 11);
     String act = server.arg("act"); act.toUpperCase();
     int argVal = server.arg("arg").toInt();
     String text = server.arg("t"), shapes = server.arg("shapes");
-    aiReply = text; currentScreen = SCR_FACE; currentMood = (Mood)m; tempMoodEnd = 0; lastAct = millis();
+    aiReply = text; currentScreen = SCR_FACE; currentMood = (Mood)m; tempMoodEnd = 0; lastAct = millis(); wasSleeping = false;
     pendingScreen = SCR_AI; pendingAt = millis() + 1400;
     if (act == "CUSTOM_FACE" || shapes.length() > 0) { parseCustomShapes(shapes); if (customShapeCount > 0) { currentMood = MOOD_CUSTOM; pendingAt = 0; toast(text.substring(0, 20), 2200); } }
+    else if (act == "TASKS") pendingScreen = SCR_TASKS;
     else if (act == "POMO_START") { int mn = constrain(argVal > 0 ? argVal : 25, 1, 99); pomoBreak = false; pomoTotal = mn * 60000UL; pomoLeft = pomoTotal; pomoRun = true; pomoTick = millis(); pendingScreen = SCR_POMO; }
     else if (act == "WEATHER") { fetchWeatherNow = true; pendingScreen = SCR_WEATHER; }
     else if (act == "CLOCK") pendingScreen = SCR_CLOCK;
@@ -1089,24 +1357,31 @@ void setup() {
   xTaskCreatePinnedToCore(core0Task, "Core0Net", 4096, NULL, 1, NULL, 0);
 
   u8g2.clearBuffer(); drawWifi(); u8g2.sendBuffer(); delay(2400);
-  lastAct = millis(); lastSaveMs = millis();
-  toast("Riddhi v6 Ready!", 1800);
+  lastAct = millis(); lastSaveMs = millis(); lastCareDecay = millis();
+  toast("Riddhi v6.1 Alive!", 1800);
 }
 
 void loop() {
   server.handleClient();
   pollIR();
+  checkCalendarSurprises();
 
   unsigned long now = millis();
   static unsigned long lastFrame = 0;
 
   if (triggerGhOta) { triggerGhOta = false; runGitHubOTA(); }
 
+  // Care / Boredom slow decay
+  if (now - lastCareDecay > CARE_DECAY_MS) {
+    lastCareDecay = now;
+    if (careLevel > 0) { careLevel = max(0, careLevel - 5); stateDirty = true; }
+  }
+
   // Background Pomodoro tick
   if (pomoRun) {
     unsigned long el = now - pomoTick; pomoTick = now;
     if (pomoLeft > el) pomoLeft -= el;
-    else { pomoLeft = 0; pomoRun = false; currentScreen = SCR_FACE; currentMood = MOOD_HYPED; tempMoodEnd = now + 4000; toast("Timer Done!", 2500); }
+    else { pomoLeft = 0; pomoRun = false; currentScreen = SCR_FACE; currentMood = MOOD_HYPED; tempMoodEnd = now + 4000; boostCare(20); toast("Timer Done!", 2500); }
   }
 
   if (pendingAt > 0 && now >= pendingAt) { pendingAt = 0; currentScreen = pendingScreen; }
@@ -1118,6 +1393,7 @@ void loop() {
     switch (currentScreen) {
       case SCR_FACE:    drawFace(); break;
       case SCR_MENU:    drawMenu(); break;
+      case SCR_TASKS:   drawTasks(); break;
       case SCR_CLOCK:   drawClock(); break;
       case SCR_WEATHER: drawWeather(); break;
       case SCR_POMO:    drawPomo(); break;
