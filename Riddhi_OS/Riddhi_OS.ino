@@ -29,10 +29,12 @@ const char* WEATHER_LON = "78.5029";
 #define WEATHER_INTERVAL_MS 900000UL    // 15 mins
 #define NUDGE_INTERVAL_MS 2700000UL     // 45 mins
 #define NTFY_INTERVAL_MS 35000UL        // 35 sec Love-Box poll
+#define NVS_SAVE_INTERVAL_MS 30000UL    // Lazy NVS flush every 30s
 // ===============================================
 
 WebServer server(80);
 Preferences prefs;
+SemaphoreHandle_t netMutex = NULL;
 
 enum ScreenMode {
   SCR_HOME = 0, SCR_MENU, SCR_CLOCK, SCR_WEATHER, SCR_POMODORO,
@@ -77,20 +79,28 @@ int blinkStage = 0;
 
 // Persistent Pet, Habits & Counter
 int petLevel = 1, petXP = 20, petHappy = 88, petEnergy = 92;
-int habitMask = 0, habitStreak = 1; // 4 bits: Gym, Study, Water, Skincare
+int habitMask = 0, habitAwardedMask = 0, habitStreak = 1, lastHabitDay = -1;
+bool habitStreakToday = false;
 String counterLabel = "GOAL";
 int counterVal = 0;
 unsigned long fireworksUntil = 0;
 unsigned long lastPetDecay = 0;
 
-// GitHub OTA & Love-Box (ntfy.sh)
-String ghRepo = "";          // e.g. "username/Riddhi"
-bool triggerGhOta = false;
-String ntfyTopic = "";       // e.g. "riddhi-secret-123"
+// Lazy NVS State
+bool stateDirty = false;
+unsigned long lastNvsSave = 0;
+
+// GitHub OTA & Love-Box (Shared with Core 0)
+String ghRepo = "";
+volatile bool triggerGhOta = false;
+volatile bool netTaskPaused = false;
+volatile bool reqWeatherNow = false;
+volatile bool newLoveMailFlag = false;
+
+String ntfyTopic = "";
 String lastNtfyId = "";
 String loveMsg = "No secret mail yet!";
 bool loveUnread = false;
-unsigned long lastNtfyPoll = 0;
 
 // Nudge, Notify & PC
 unsigned long lastNudgeAt = 0;
@@ -112,13 +122,13 @@ String aiReplyText = "Ask me anything or invent a face!";
 Mood aiReplyMood = MOOD_HAPPY;
 ScreenMode pendingScreen = SCR_HOME;
 unsigned long pendingScreenAt = 0;
-bool weatherNeedsFetch = false;
 String toastText = "";
 unsigned long toastUntil = 0;
-bool weatherLoaded = false;
+
+volatile bool weatherLoaded = false;
 float weatherTemp = 0, weatherWind = 0;
 int weatherHumidity = 0, weatherCode = 0;
-unsigned long lastWeatherFetch = 0;
+
 bool pomoRunning = false, pomoBreak = false;
 unsigned long pomoMaxMs = 25UL * 60000UL, pomoRemainingMs = 25UL * 60000UL, pomoLastTick = 0;
 String customNote = "Send a lovely note from your phone!";
@@ -135,13 +145,11 @@ float carX = 132, racerSpeed = 3.6f;
 int reactStage = 0;
 unsigned long gameOverAt = 0, reactGoAt = 0, reactResultMs = 0, reactBestMs = 9999;
 
-// Pixel Fishing State
-int fishStage = 0; // 0=Ready, 1=Waiting, 2=BITE!, 3=Caught/Missed
+int fishStage = 0;
 unsigned long fishBiteAt = 0, fishExpireAt = 0;
 int fishCaught = 0;
 String lastFishName = "";
 
-// Timing Lock State
 float lockPos = 64.0f, lockDir = 2.4f;
 int lockLevel = 1, lockBest = 1;
 bool lockOver = false;
@@ -153,15 +161,18 @@ int irWaveCount = 0;
 String activeIP = "192.168.4.1";
 bool isAPMode = false;
 
-// ================= PERSISTENT STORAGE =================
-void saveState() {
+// ================= PERSISTENT STORAGE (LAZY NVS) =================
+void saveStateNow() {
   prefs.begin("riddhi", false);
   prefs.putInt("lv", petLevel);
   prefs.putInt("xp", petXP);
   prefs.putInt("hp", petHappy);
   prefs.putInt("en", petEnergy);
   prefs.putInt("hMask", habitMask);
+  prefs.putInt("hAwrd", habitAwardedMask);
   prefs.putInt("hStr", habitStreak);
+  prefs.putInt("hDay", lastHabitDay);
+  prefs.putBool("hStrD", habitStreakToday);
   prefs.putString("cLbl", counterLabel);
   prefs.putInt("cVal", counterVal);
   prefs.putInt("dHi", dinoHi);
@@ -173,30 +184,48 @@ void saveState() {
   prefs.putString("ghRepo", ghRepo);
   prefs.putString("ntfy", ntfyTopic);
   prefs.end();
+  stateDirty = false;
+  lastNvsSave = millis();
 }
+
+void markDirty() { stateDirty = true; }
 
 void loadState() {
   prefs.begin("riddhi", true);
-  petLevel     = prefs.getInt("lv", 1);
-  petXP        = prefs.getInt("xp", 20);
-  petHappy     = prefs.getInt("hp", 88);
-  petEnergy    = prefs.getInt("en", 92);
-  habitMask    = prefs.getInt("hMask", 0);
-  habitStreak  = prefs.getInt("hStr", 1);
-  counterLabel = prefs.getString("cLbl", "GOAL");
-  counterVal   = prefs.getInt("cVal", 0);
-  dinoHi       = prefs.getInt("dHi", 0);
-  heliHi       = prefs.getInt("hHi", 0);
-  racerHi      = prefs.getInt("rHi", 0);
-  fishCaught   = prefs.getInt("fCnt", 0);
-  lockBest     = prefs.getInt("lBst", 1);
-  reactBestMs  = prefs.getULong("reBst", 9999);
-  ghRepo       = prefs.getString("ghRepo", "");
-  ntfyTopic    = prefs.getString("ntfy", "");
+  petLevel         = prefs.getInt("lv", 1);
+  petXP            = prefs.getInt("xp", 20);
+  petHappy         = prefs.getInt("hp", 88);
+  petEnergy        = prefs.getInt("en", 92);
+  habitMask        = prefs.getInt("hMask", 0);
+  habitAwardedMask = prefs.getInt("hAwrd", 0);
+  habitStreak      = prefs.getInt("hStr", 1);
+  lastHabitDay     = prefs.getInt("hDay", -1);
+  habitStreakToday = prefs.getBool("hStrD", false);
+  counterLabel     = prefs.getString("cLbl", "GOAL");
+  counterVal       = prefs.getInt("cVal", 0);
+  dinoHi           = prefs.getInt("dHi", 0);
+  heliHi           = prefs.getInt("hHi", 0);
+  racerHi          = prefs.getInt("rHi", 0);
+  fishCaught       = prefs.getInt("fCnt", 0);
+  lockBest         = prefs.getInt("lBst", 1);
+  reactBestMs      = prefs.getULong("reBst", 9999);
+  ghRepo           = prefs.getString("ghRepo", "");
+  ntfyTopic        = prefs.getString("ntfy", "");
   prefs.end();
 }
 
-// ================= LOVELY UI HELPERS =================
+// ================= HELPERS =================
+String jsonEscape(const String& s) {
+  String out = "";
+  out.reserve(s.length() + 4);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') out += '\\';
+    if (c >= 0x20) out += c;
+  }
+  return out;
+}
+
 void showToast(const String& msg, unsigned long ms = 1500) { toastText = msg; toastUntil = millis() + ms; }
 
 void drawSafeRBox(int x, int y, int w, int h, int r) {
@@ -244,7 +273,7 @@ void addPetXP(int xp, int happyBoost = 5, int energyDelta = 0) {
   }
   petHappy = constrain(petHappy + happyBoost, 0, 100);
   petEnergy = constrain(petEnergy + energyDelta, 0, 100);
-  saveState();
+  markDirty();
 }
 
 void drawWrappedText(const String& text, int startY, int lh, int maxL, int maxC) {
@@ -278,12 +307,108 @@ void drawBootProgress(int pct, const char* label) {
   u8g2.sendBuffer();
 }
 
-// ================= 1-TAP GITHUB SELF-UPDATE =================
+// ================= CORE 0 BACKGROUND NETWORK TASK =================
+float extractCurrentValue(const String& json, const char* key, float fb) {
+  int ci = json.indexOf("\"current\":{"); if (ci < 0) return fb;
+  int ki = json.indexOf(key, ci); if (ki < 0) return fb;
+  int vs = ki + strlen(key), ve = vs;
+  while (ve < (int)json.length() && (isDigit(json[ve]) || json[ve] == '.' || json[ve] == '-')) ve++;
+  return json.substring(vs, ve).toFloat();
+}
+
+String extractJsonStr(const String& json, const char* key) {
+  String pat = String("\"") + key + "\":\"";
+  int idx = json.indexOf(pat);
+  if (idx < 0) return "";
+  int st = idx + pat.length();
+  int en = json.indexOf("\"", st);
+  return (en > st) ? json.substring(st, en) : "";
+}
+
+void bgFetchWeather() {
+  HTTPClient http;
+  http.setTimeout(4000);
+  String url = String("http://api.open-meteo.com/v1/forecast?latitude=") + WEATHER_LAT +
+               "&longitude=" + WEATHER_LON +
+               "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m";
+  if (http.begin(url) && http.GET() == HTTP_CODE_OK) {
+    String p = http.getString();
+    float t = extractCurrentValue(p, "\"temperature_2m\":", weatherTemp);
+    int h = (int)extractCurrentValue(p, "\"relative_humidity_2m\":", weatherHumidity);
+    int c = (int)extractCurrentValue(p, "\"weather_code\":", weatherCode);
+    float w = extractCurrentValue(p, "\"wind_speed_10m\":", weatherWind);
+    if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      weatherTemp = t; weatherHumidity = h; weatherCode = c; weatherWind = w;
+      weatherLoaded = true;
+      xSemaphoreGive(netMutex);
+    }
+  }
+  http.end();
+}
+
+void bgPollLoveBox() {
+  String topicCopy = "";
+  if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    topicCopy = ntfyTopic;
+    xSemaphoreGive(netMutex);
+  }
+  if (topicCopy.length() < 2) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(4000);
+  String url = "https://ntfy.sh/" + topicCopy + "/json?poll=1&since=latest";
+  if (http.begin(client, url) && http.GET() == HTTP_CODE_OK) {
+    String payload = http.getString();
+    String id = extractJsonStr(payload, "id");
+    String msg = extractJsonStr(payload, "message");
+    if (id.length() > 0 && id != lastNtfyId && msg.length() > 0) {
+      bool firstBoot = (lastNtfyId.length() == 0);
+      lastNtfyId = id;
+      if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        loveMsg = msg;
+        if (!firstBoot) newLoveMailFlag = true;
+        xSemaphoreGive(netMutex);
+      }
+    }
+  }
+  http.end();
+}
+
+void networkTaskCore0(void* pvParameters) {
+  unsigned long lastW = 0, lastN = 0;
+  for (;;) {
+    if (!netTaskPaused && WiFi.status() == WL_CONNECTED) {
+      unsigned long now = millis();
+      if (reqWeatherNow || lastW == 0 || (now - lastW > WEATHER_INTERVAL_MS)) {
+        reqWeatherNow = false;
+        bgFetchWeather();
+        lastW = millis();
+      }
+      if (now - lastN > NTFY_INTERVAL_MS) {
+        bgPollLoveBox();
+        lastN = millis();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ================= CLEAN 1-TAP GITHUB SELF-UPDATE =================
 void runGitHubOTA() {
   if (WiFi.status() != WL_CONNECTED || ghRepo.length() < 3) {
     showToast("Set GitHub Repo!", 2000);
     return;
   }
+  if (stateDirty) saveStateNow();
+
+  // Pause Core 0 network task & free WebServer/mDNS RAM before TLS OTA
+  netTaskPaused = true;
+  server.stop();
+  MDNS.end();
+  delay(250);
+
   drawBootProgress(10, "Connecting GitHub...");
   WiFiClientSecure client;
   client.setInsecure();
@@ -302,44 +427,61 @@ void runGitHubOTA() {
   String url = "https://github.com/" + ghRepo + "/releases/download/latest/Riddhi_OS.ino.bin";
   t_httpUpdate_return ret = httpUpdate.update(client, url);
   if (ret == HTTP_UPDATE_FAILED) {
-    drawBootProgress(0, "GitHub OTA Failed!");
+    drawBootProgress(0, "OTA Failed! Rebooting");
     delay(2000);
+    ESP.restart(); // Cleanly restore server & mDNS
   }
 }
 
-// ================= REMOTE LOVE-BOX (NTFY.SH) =================
-String extractJsonStr(const String& json, const char* key) {
-  String pat = String("\"") + key + "\":\"";
-  int idx = json.indexOf(pat);
-  if (idx < 0) return "";
-  int st = idx + pat.length();
-  int en = json.indexOf("\"", st);
-  return (en > st) ? json.substring(st, en) : "";
+// ================= BACKGROUND POMODORO & MIDNIGHT HABITS =================
+void updatePomodoro() {
+  if (!pomoRunning) return;
+  unsigned long now = millis();
+  unsigned long el = now - pomoLastTick;
+  pomoLastTick = now;
+  if (pomoRemainingMs > el) {
+    pomoRemainingMs -= el;
+  } else {
+    pomoRemainingMs = 0;
+    pomoRunning = false;
+    currentScreen = SCR_HOME;
+    currentMood = MOOD_HAPPY;
+    tempMoodUntil = now + 5000;
+    addPetXP(30, 15, -5);
+    showToast("Done! +30 XP", 3000);
+  }
 }
 
-void pollLoveBox() {
-  if (WiFi.status() != WL_CONNECTED || ntfyTopic.length() < 2) return;
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(3000);
-  String url = "https://ntfy.sh/" + ntfyTopic + "/json?poll=1&since=latest";
-  if (http.begin(client, url) && http.GET() == HTTP_CODE_OK) {
-    String payload = http.getString();
-    String id = extractJsonStr(payload, "id");
-    String msg = extractJsonStr(payload, "message");
-    if (id.length() > 0 && id != lastNtfyId && msg.length() > 0) {
-      bool firstBoot = (lastNtfyId.length() == 0);
-      lastNtfyId = id;
-      loveMsg = msg;
-      if (!firstBoot) {
-        loveUnread = true;
-        currentScreen = SCR_LOVEBOX;
-        lastActivity = millis();
-      }
+void checkMidnightAndNightstand() {
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 30000UL) return;
+  lastCheck = now;
+
+  struct tm ti;
+  if (!getLocalTime(&ti, 5)) return;
+
+  // Midnight Habit Reset
+  if (lastHabitDay == -1) {
+    lastHabitDay = ti.tm_yday;
+    markDirty();
+  } else if (ti.tm_yday != lastHabitDay) {
+    if (habitMask != 15) habitStreak = 0; // Reset streak if yesterday wasn't completed
+    habitMask = 0;
+    habitAwardedMask = 0;
+    habitStreakToday = false;
+    lastHabitDay = ti.tm_yday;
+    saveStateNow();
+  }
+
+  // Auto Nightstand Dimming (11:00 PM - 6:30 AM IST)
+  if (!manualNight) {
+    bool shouldDim = (ti.tm_hour >= 23 || ti.tm_hour < 6 || (ti.tm_hour == 6 && ti.tm_min < 30));
+    if (shouldDim != nightMode) {
+      nightMode = shouldDim;
+      u8g2.setContrast(nightMode ? 5 : 255);
     }
   }
-  http.end();
 }
 
 // ================= CUSTOM AI FACE =================
@@ -595,7 +737,7 @@ void drawReact() {
 void drawFishing() {
   unsigned long now = millis();
   char b[16]; sprintf(b, "CAUGHT:%d", fishCaught); drawHeader("FISHING", b);
-  u8g2.drawHLine(0, 46, 128); // Water line
+  u8g2.drawHLine(0, 46, 128);
   if (fishStage == 0) { u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(16, 32, "Wave to Cast Line!"); }
   else if (fishStage == 1) {
     if (now >= fishBiteAt) fishStage = 2;
@@ -621,16 +763,16 @@ void drawLock() {
   }
   char b[16]; sprintf(b, "LV:%d HI:%d", lockLevel, lockBest); drawHeader("SAFE LOCK", b);
   drawSafeRFrame(8, 28, 112, 14, 4);
-  u8g2.drawBox(52, 28, 24, 14); // Target sweet spot
+  u8g2.drawBox(52, 28, 24, 14);
   u8g2.setDrawColor(0); u8g2.drawBox(54, 30, 20, 10); u8g2.setDrawColor(1);
-  u8g2.drawBox((int)lockPos - 2, 25, 4, 20); // Sweeping needle
+  u8g2.drawBox((int)lockPos - 2, 25, 4, 20);
   u8g2.setFont(u8g2_font_5x7_tf);
   u8g2.drawStr(16, 58, lockOver ? "MISSED! Wave:Retry" : "Wave in Center Zone!");
 }
 
 void drawBreathing() {
   drawHeader("4-7-8 BREATH", "4x:Home");
-  unsigned long sec = (millis() / 1000) % 19; // 4s In + 7s Hold + 8s Out
+  unsigned long sec = (millis() / 1000) % 19;
   int r = 6; const char* lbl = "INHALE";
   if (sec < 4) { r = 6 + (int)((millis() % 19000) * 14 / 4000); lbl = "INHALE (4s)"; }
   else if (sec < 11) { r = 20; lbl = "HOLD (7s)"; }
@@ -640,7 +782,7 @@ void drawBreathing() {
   u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(62, 41, lbl);
 }
 
-// ================= NEW LIFESTYLE SCREENS =================
+// ================= LIFESTYLE & CORE SCREENS =================
 void drawHabits() {
   char b[16]; sprintf(b, "STREAK:%d", habitStreak); drawHeader("HABITS", b);
   const char* hNames[4] = {"Gym", "Study", "Water", "Skincare"};
@@ -652,7 +794,7 @@ void drawHabits() {
     if (done) u8g2.drawBox(x + 2, y - 6, 5, 5);
     u8g2.drawStr(x + 13, y, hNames[i]);
   }
-  u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(14, 61, "Check off on Phone!");
+  u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(14, 61, "Auto-resets at 12 AM");
 }
 
 void drawCounter() {
@@ -677,12 +819,13 @@ void drawLoveBox() {
     drawMiniHeart(64, 38 + bob);
   } else {
     drawHeader("LOVE-BOX", "4x:Home");
+    String msgCopy = "";
+    if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) { msgCopy = loveMsg; xSemaphoreGive(netMutex); }
     u8g2.setFont(u8g2_font_6x10_tf);
-    drawWrappedText(loveMsg, 26, 11, 3, 20);
+    drawWrappedText(msgCopy, 26, 11, 3, 20);
   }
 }
 
-// ================= CORE SCREENS =================
 void initSavers() {
   for (int i = 0; i < 16; i++) matrixY[i] = random(-60, 0);
   for (int i = 0; i < 20; i++) { starX[i] = random(-64, 64); starY[i] = random(-32, 32); starZ[i] = random(1, 64); }
@@ -749,36 +892,15 @@ void drawNotify() {
   u8g2.setFont(u8g2_font_6x10_tf); drawWrappedText(notifyMsg, 26, 11, 3, 20);
 }
 
-float extractCurrentValue(const String& json, const char* key, float fb) {
-  int ci = json.indexOf("\"current\":{"); if (ci < 0) return fb;
-  int ki = json.indexOf(key, ci); if (ki < 0) return fb;
-  int vs = ki + strlen(key), ve = vs;
-  while (ve < (int)json.length() && (isDigit(json[ve]) || json[ve] == '.' || json[ve] == '-')) ve++;
-  return json.substring(vs, ve).toFloat();
-}
-
-void fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http; http.setTimeout(3500);
-  http.begin(String("http://api.open-meteo.com/v1/forecast?latitude=") + WEATHER_LAT + "&longitude=" + WEATHER_LON + "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m");
-  if (http.GET() == HTTP_CODE_OK) {
-    String p = http.getString();
-    weatherTemp = extractCurrentValue(p, "\"temperature_2m\":", weatherTemp);
-    weatherHumidity = (int)extractCurrentValue(p, "\"relative_humidity_2m\":", weatherHumidity);
-    weatherCode = (int)extractCurrentValue(p, "\"weather_code\":", weatherCode);
-    weatherWind = extractCurrentValue(p, "\"wind_speed_10m\":", weatherWind);
-    weatherLoaded = true; lastWeatherFetch = millis();
-  }
-  http.end();
-}
-
 void drawWeather() {
   drawHeader("WEATHER", "1x:Sync");
   if (WiFi.status() != WL_CONNECTED) { u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(8, 38, "Connect Wi-Fi first"); return; }
-  if (!weatherLoaded) { fetchWeather(); return; }
-  char tb[12]; sprintf(tb, "%.1fC", weatherTemp);
+  if (!weatherLoaded) { u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(14, 38, "Syncing weather..."); return; }
+  float t = 0, w = 0; int h = 0;
+  if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) { t = weatherTemp; h = weatherHumidity; w = weatherWind; xSemaphoreGive(netMutex); }
+  char tb[12]; sprintf(tb, "%.1fC", t);
   u8g2.setFont(u8g2_font_logisoso18_tf); u8g2.drawStr(24, 38, tb);
-  char sb[28]; sprintf(sb, "RH:%d%%   Wind:%.0fkm/h", weatherHumidity, weatherWind);
+  char sb[28]; sprintf(sb, "RH:%d%%   Wind:%.0fkm/h", h, w);
   u8g2.drawHLine(0, 50, 128); u8g2.setFont(u8g2_font_5x7_tf); u8g2.drawStr(10, 61, sb);
 }
 
@@ -794,15 +916,6 @@ void drawClock() {
 }
 
 void drawPomodoro() {
-  unsigned long now = millis();
-  if (pomoRunning) {
-    unsigned long el = now - pomoLastTick; pomoLastTick = now;
-    if (pomoRemainingMs > el) pomoRemainingMs -= el;
-    else {
-      pomoRemainingMs = 0; pomoRunning = false; currentScreen = SCR_HOME; currentMood = MOOD_HAPPY;
-      tempMoodUntil = now + 5000; addPetXP(30, 15, -5); showToast("Done! +30 XP", 3000); return;
-    }
-  }
   char b[10], t[16]; sprintf(b, "%02d:%02d", (int)((pomoRemainingMs / 1000) / 60), (int)((pomoRemainingMs / 1000) % 60));
   sprintf(t, "%s %dM", pomoBreak ? "BREAK" : "FOCUS", (int)(pomoMaxMs / 60000UL));
   drawHeader(t, pomoRunning ? "RUN" : "PAUSE");
@@ -812,7 +925,7 @@ void drawPomodoro() {
 }
 
 void drawMenu() {
-  drawHeader("RIDDHI v5", "2x:Next");
+  drawHeader("RIDDHI v5.1", "2x:Next");
   int st = (menuIndex >= 4) ? menuIndex - 3 : 0;
   float targetY = 15.0f + (menuIndex - st) * 12.0f;
   menuHighlightY += (targetY - menuHighlightY) * 0.35f;
@@ -883,9 +996,9 @@ void triggerGesture(int waves, bool isHold) {
   if (waves == 1) {
     if (isGameScreen(currentScreen)) handleArcadeTap();
     else if (currentScreen == SCR_LOVEBOX && loveUnread) { loveUnread = false; addPetXP(5, 10, 0); }
-    else if (currentScreen == SCR_COUNTER) { counterVal++; saveState(); if (counterVal % 10 == 0) fireworksUntil = millis() + 2500; }
+    else if (currentScreen == SCR_COUNTER) { counterVal++; markDirty(); if (counterVal % 10 == 0) fireworksUntil = millis() + 2500; }
     else if (currentScreen == SCR_SAVER) saverMode = (saverMode + 1) % 3;
-    else if (currentScreen == SCR_WEATHER) fetchWeather();
+    else if (currentScreen == SCR_WEATHER) { reqWeatherNow = true; showToast("Syncing...", 1000); }
     else if (currentScreen == SCR_POMODORO) { pomoRunning = !pomoRunning; pomoLastTick = millis(); }
     else if (currentScreen == SCR_MENU) menuIndex = (menuIndex + 1) % MENU_COUNT;
     else if (currentScreen == SCR_HOME) {
@@ -923,7 +1036,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Riddhi OS">
-<title>Riddhi OS v5</title><style>
+<title>Riddhi OS v5.1</title><style>
 :root{--bg:#0b0f19;--card:rgba(24,31,52,.88);--btn:#1e2640;--acc:#38bdf8;--ai:#a855f7;--pink:#f472b6;--ok:#34d399;--red:#fb7185;}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:radial-gradient(circle at top,#1e1b4b 0%,var(--bg) 55%);color:#f8fafc;margin:0;padding:16px 14px 86px;min-height:100vh;}
@@ -964,9 +1077,8 @@ input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(25
 </style></head><body>
 
 <div id="toast">Sent!</div>
-<div class="top"><div class="brand"><span class="dot"></span><h2>Riddhi OS v5</h2></div><span id="lvPill" class="pill">LV.1</span></div>
+<div class="top"><div class="brand"><span class="dot"></span><h2>Riddhi OS v5.1</h2></div><span id="lvPill" class="pill">LV.1</span></div>
 
-<!-- PAGE 1: HOME -->
 <div id="p-home" class="page active">
   <div class="card">
     <div class="t">Riddhi Pet (Saved Permanently)</div>
@@ -1000,7 +1112,6 @@ input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(25
   </div>
 </div>
 
-<!-- PAGE 2: AI -->
 <div id="p-ai" class="page">
   <div class="card ai">
     <div class="t">Gemini AI (With Memory & Personas)</div>
@@ -1038,7 +1149,6 @@ input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(25
   </div>
 </div>
 
-<!-- PAGE 3: PLAY -->
 <div id="p-play" class="page">
   <div class="card">
     <div class="t">IR Arcade Pack (6 Games)</div>
@@ -1060,7 +1170,6 @@ input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(25
   </div>
 </div>
 
-<!-- PAGE 4: APPS -->
 <div id="p-apps" class="page">
   <div class="card">
     <div class="t">Desk & Lifestyle Apps</div>
@@ -1098,16 +1207,15 @@ input,select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(25
   </div>
 </div>
 
-<!-- PAGE 5: SYSTEM -->
 <div id="p-sys" class="page">
   <div class="card">
     <div class="t">1-Tap GitHub Self-Update</div>
-    <input id="ghRepo" placeholder="GitHub repo (e.g. yourname/Riddhi)">
+    <input id="ghRepo" placeholder="Public repo (e.g. yourname/Riddhi)">
     <div class="g2">
       <button onclick="saveGh()">Save Repo</button>
       <button class="aib" onclick="pullGh()">Pull Latest Update</button>
     </div>
-    <div class="sub">Pulls Riddhi_OS.ino.bin directly from GitHub Releases!</div>
+    <div class="sub">Pulls Riddhi_OS.ino.bin directly from Public GitHub Releases.</div>
   </div>
   <div class="card">
     <div class="t">Remote Love-Box (ntfy.sh Topic)</div>
@@ -1190,7 +1298,8 @@ function saveFavFace(){
 
 async function syncStatus(){
   try{
-    const r=await fetch('/status'); const s=await r.json();
+    const r=await fetch('/status'); if(!r.ok) return;
+    const s=await r.json();
     document.getElementById('lvPill').innerText='LV.'+s.lv;
     document.getElementById('vHp').innerText=s.hp+'%'; document.getElementById('bHp').style.width=s.hp+'%';
     document.getElementById('vEn').innerText=s.en+'%'; document.getElementById('bEn').style.width=s.en+'%';
@@ -1237,18 +1346,23 @@ async function askAI(){
   if(!p)return; document.getElementById('aiP').value=''; lg.innerText='Riddhi is thinking...'; fetch('/aithink');
   const pMap={cute:'cute witty desk buddy',coach:'strict motivating study coach',gym:'high-energy gym bro motivator',hacker:'sarcastic cyberpunk hacker'};
   const sys='You are Riddhi, a '+pMap[document.getElementById('aiPers').value]+' ESP32 robot (128x64 OLED). Return ONLY JSON: {"mood":"NORMAL|HAPPY|LOVE|ANGRY|DIZZY|SURPRISED|SLEEP","action":"NONE|CUSTOM_FACE|POMO_START|WEATHER|CLOCK|DINO|HELI|RACER|REACT|FISH|LOCK|BREATH|SAVER|PC|PET","arg":0,"reply":"ASCII <50 chars","shapes":[]}. For custom faces use action="CUSTOM_FACE" with shapes (rbox,disc,circle,line,arc).';
-  aiHist.push({role:'user',parts:[{text:p}]}); if(aiHist.length>6) aiHist=aiHist.slice(-6);
+  const reqContents=[...aiHist, {role:'user',parts:[{text:p}]}];
   try{
     const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+m+':generateContent?key='+encodeURIComponent(k),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({system_instruction:{parts:[{text:sys}]},generationConfig:{responseMimeType:'application/json'},contents:aiHist})});
-    const d=await r.json(); const raw=d.candidates[0].content.parts[0].text.replace(/^```json|```$/gi,'').trim();
-    const j=JSON.parse(raw); aiHist.push({role:'model',parts:[{text:j.reply||'OK'}]});
+    body:JSON.stringify({system_instruction:{parts:[{text:sys}]},generationConfig:{responseMimeType:'application/json'},contents:reqContents})});
+    const d=await r.json();
+    if(!r.ok) throw new Error((d.error&&d.error.message)||('HTTP '+r.status));
+    if(!d.candidates||!d.candidates[0]||!d.candidates[0].content) throw new Error('Empty AI response');
+    const raw=d.candidates[0].content.parts[0].text.replace(/^```json|```$/gi,'').trim();
+    const j=JSON.parse(raw);
+    aiHist.push({role:'user',parts:[{text:p}]}, {role:'model',parts:[{text:j.reply||'OK'}]});
+    if(aiHist.length>6) aiHist=aiHist.slice(-6);
     const mm={NORMAL:0,HAPPY:1,LOVE:2,ANGRY:3,DIZZY:4,SURPRISED:5,SLEEP:6}; lg.innerText=j.reply||'Done!';
     const b=new URLSearchParams(); b.set('m',mm[(j.mood||'HAPPY').toUpperCase()]??1); b.set('act',(j.action||'NONE').toUpperCase()); b.set('arg',j.arg||0); b.set('t',(j.reply||'').replace(/[^\x20-\x7E]/g,'').slice(0,60));
     const sh=ser(j.shapes); if(sh){b.set('shapes',sh);lastShapes=sh;lastFaceName=p;}
     await fetch('/ai',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b.toString()});
     if(ttsOn&&'speechSynthesis'in window){window.speechSynthesis.cancel();window.speechSynthesis.speak(new SpeechSynthesisUtterance(j.reply||''));}
-  }catch(e){lg.innerText='Err: '+e.message;}
+  }catch(e){lg.innerText='AI Error: '+e.message; fetch('/mood?m=4');}
 }
 </script></body></html>
 )rawliteral";
@@ -1260,28 +1374,41 @@ void setupWebServer() {
     String j = "{\"lv\":" + String(petLevel) + ",\"xp\":" + String(petXP) +
                ",\"hp\":" + String(petHappy) + ",\"en\":" + String(petEnergy) +
                ",\"hm\":" + String(habitMask) + ",\"hs\":" + String(habitStreak) +
-               ",\"gh\":\"" + ghRepo + "\",\"ntfy\":\"" + ntfyTopic + "\"}";
+               ",\"gh\":\"" + jsonEscape(ghRepo) + "\",\"ntfy\":\"" + jsonEscape(ntfyTopic) + "\"}";
     server.send(200, "application/json", j);
   });
 
   server.on("/cfg", []() {
     if (server.hasArg("gh")) ghRepo = server.arg("gh");
-    if (server.hasArg("ntfy")) { ntfyTopic = server.arg("ntfy"); lastNtfyId = ""; }
-    saveState(); server.send(200, "text/plain", "OK");
+    if (server.hasArg("ntfy")) {
+      if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ntfyTopic = server.arg("ntfy");
+        lastNtfyId = "";
+        xSemaphoreGive(netMutex);
+      }
+    }
+    saveStateNow();
+    server.send(200, "text/plain", "OK");
   });
 
-  server.on("/ghota", []() {
-    server.send(200, "text/plain", "OK");
-    triggerGhOta = true;
-  });
+  server.on("/ghota", []() { server.send(200, "text/plain", "OK"); triggerGhOta = true; });
 
   server.on("/habit", []() {
     int i = server.arg("i").toInt();
     if (i >= 0 && i < 4) {
       habitMask ^= (1 << i);
-      if (habitMask & (1 << i)) addPetXP(10, 8, 5);
-      if (habitMask == 15) { habitStreak++; showToast("ALL HABITS! +Streak", 2200); }
-      saveState();
+      // Award XP only once per habit per day
+      if ((habitMask & (1 << i)) && !(habitAwardedMask & (1 << i))) {
+        habitAwardedMask |= (1 << i);
+        addPetXP(10, 8, 5);
+      }
+      // Increment streak only once per day when all 4 habits are done
+      if (habitMask == 15 && !habitStreakToday) {
+        habitStreakToday = true;
+        habitStreak++;
+        showToast("ALL HABITS! +Streak", 2200);
+      }
+      markDirty();
     }
     server.send(200, "text/plain", "OK");
   });
@@ -1290,7 +1417,7 @@ void setupWebServer() {
     if (server.hasArg("l")) counterLabel = server.arg("l");
     if (server.hasArg("v")) counterVal = server.arg("v").toInt();
     if (server.hasArg("inc")) counterVal += server.arg("inc").toInt();
-    saveState(); currentScreen = SCR_COUNTER;
+    markDirty(); currentScreen = SCR_COUNTER;
     if (counterVal > 0 && counterVal % 10 == 0) fireworksUntil = millis() + 2500;
     server.send(200, "text/plain", "OK");
   });
@@ -1310,11 +1437,22 @@ void setupWebServer() {
   }, []() {
     HTTPUpload& upload = server.upload();
     static unsigned long lastOtaDraw = 0;
-    if (upload.status == UPLOAD_FILE_START) { drawBootProgress(5, "Starting OTA..."); Update.begin(UPDATE_SIZE_UNKNOWN); }
-    else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (upload.status == UPLOAD_FILE_START) {
+      netTaskPaused = true;
+      if (stateDirty) saveStateNow();
+      drawBootProgress(5, "Starting OTA...");
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
       Update.write(upload.buf, upload.currentSize);
-      if (millis() - lastOtaDraw > 180) { lastOtaDraw = millis(); char lbl[24]; sprintf(lbl, "Flashing %d KB...", upload.totalSize / 1024); drawBootProgress(constrain((upload.totalSize / 1024) * 100 / 1150, 8, 96), lbl); }
-    } else if (upload.status == UPLOAD_FILE_END) { drawBootProgress(Update.end(true) ? 100 : 0, Update.hasError() ? "OTA Failed!" : "Rebooting..."); }
+      if (millis() - lastOtaDraw > 180) {
+        lastOtaDraw = millis();
+        char lbl[24]; sprintf(lbl, "Flashing %d KB...", upload.totalSize / 1024);
+        drawBootProgress(constrain((upload.totalSize / 1024) * 100 / 1150, 8, 96), lbl);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      drawBootProgress(Update.end(true) ? 100 : 0, Update.hasError() ? "OTA Failed!" : "Rebooting...");
+      if (Update.hasError()) netTaskPaused = false;
+    }
   });
 
   server.on("/g", []() { triggerGesture(server.arg("w").toInt(), false); server.send(200, "text/plain", "OK"); });
@@ -1347,7 +1485,7 @@ void setupWebServer() {
     pendingScreen = SCR_AI; pendingScreenAt = millis() + 1400;
     if (act == "CUSTOM_FACE" || shapes.length() > 0) { parseCustomShapes(shapes); if (customShapeCount > 0) { currentMood = MOOD_CUSTOM; pendingScreenAt = 0; showToast(text.substring(0, 20), 2400); } }
     else if (act == "POMO_START") { int mn = constrain(argVal > 0 ? argVal : 25, 1, 99); pomoBreak = false; pomoMaxMs = mn * 60000UL; pomoRemainingMs = pomoMaxMs; pomoRunning = true; pomoLastTick = millis(); pendingScreen = SCR_POMODORO; }
-    else if (act == "WEATHER") { weatherNeedsFetch = true; pendingScreen = SCR_WEATHER; }
+    else if (act == "WEATHER") { reqWeatherNow = true; pendingScreen = SCR_WEATHER; }
     else if (act == "CLOCK") pendingScreen = SCR_CLOCK;
     else if (act == "DINO") pendingScreen = SCR_DINO;
     else if (act == "HELI") pendingScreen = SCR_HELI;
@@ -1377,6 +1515,7 @@ void setupWebServer() {
 // ================= SETUP & LOOP =================
 void setup() {
   Serial.begin(115200); pinMode(IR_PIN, INPUT); Wire.begin(21, 22); u8g2.begin();
+  netMutex = xSemaphoreCreateMutex();
   loadState(); initSavers(); playBootAnimation();
 
   WiFi.persistent(true); WiFi.mode(WIFI_STA); WiFi.begin();
@@ -1386,43 +1525,51 @@ void setup() {
     isAPMode = false; activeIP = WiFi.localIP().toString();
     MDNS.begin("riddhi");
     configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
-    fetchWeather();
   } else {
     isAPMode = true; WiFi.disconnect(false); WiFi.setAutoReconnect(false); delay(150);
     WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS, 1); activeIP = WiFi.softAPIP().toString();
   }
+
   setupWebServer();
+
+  // Launch non-blocking background network task on Core 0
+  xTaskCreatePinnedToCore(networkTaskCore0, "NetCore0", 6144, NULL, 1, NULL, 0);
+
   u8g2.clearBuffer(); drawWifiInfo(); u8g2.sendBuffer(); delay(2500);
-  lastActivity = millis(); lastNudgeAt = millis(); lastPetDecay = millis();
-  showToast("Riddhi v5 Ready!", 1800);
+  lastActivity = millis(); lastNudgeAt = millis(); lastPetDecay = millis(); lastNvsSave = millis();
+  showToast("Riddhi v5.1 Ready!", 1800);
 }
 
 void loop() {
   server.handleClient();
   updateIRSensor();
-  static unsigned long lastFrame = 0, lastNightChk = 0;
+  updatePomodoro();
+  checkMidnightAndNightstand();
+
+  static unsigned long lastFrame = 0;
   unsigned long now = millis();
 
   if (triggerGhOta) { triggerGhOta = false; runGitHubOTA(); }
 
+  // Handle incoming Love-Box mail from Core 0
+  if (newLoveMailFlag) {
+    newLoveMailFlag = false;
+    loveUnread = true;
+    currentScreen = SCR_LOVEBOX;
+    lastActivity = now;
+  }
+
   if (pendingScreenAt > 0 && now >= pendingScreenAt) {
     pendingScreenAt = 0; currentScreen = pendingScreen;
-    if (weatherNeedsFetch) { weatherNeedsFetch = false; fetchWeather(); }
   }
 
-  // Auto Nightstand Dimming (11:00 PM – 6:30 AM IST)
-  if (!manualNight && now - lastNightChk > 60000UL) {
-    lastNightChk = now; struct tm ti;
-    if (getLocalTime(&ti, 5)) {
-      bool shouldDim = (ti.tm_hour >= 23 || ti.tm_hour < 6 || (ti.tm_hour == 6 && ti.tm_min < 30));
-      if (shouldDim != nightMode) { nightMode = shouldDim; u8g2.setContrast(nightMode ? 5 : 255); }
-    }
+  // Lazy NVS Flash Save (batched every 30s if dirty)
+  if (stateDirty && (now - lastNvsSave > NVS_SAVE_INTERVAL_MS)) {
+    saveStateNow();
   }
 
-  if (now - lastPetDecay > 600000UL) { lastPetDecay = now; petHappy = max(0, petHappy - 2); petEnergy = max(0, petEnergy - 1); }
+  if (now - lastPetDecay > 600000UL) { lastPetDecay = now; petHappy = max(0, petHappy - 2); petEnergy = max(0, petEnergy - 1); markDirty(); }
   if (currentScreen == SCR_HOME && (now - lastNudgeAt > NUDGE_INTERVAL_MS)) { lastNudgeAt = now; nudgeIsWater = !nudgeIsWater; currentScreen = SCR_NUDGE; }
-  if (currentScreen == SCR_HOME && ntfyTopic.length() > 1 && (now - lastNtfyPoll > NTFY_INTERVAL_MS)) { lastNtfyPoll = now; pollLoveBox(); }
-  if (WiFi.status() == WL_CONNECTED && !isGameScreen(currentScreen) && (now - lastWeatherFetch > WEATHER_INTERVAL_MS)) fetchWeather();
 
   if (now - lastFrame >= 33) {
     lastFrame = now;
