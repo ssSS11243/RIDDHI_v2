@@ -107,7 +107,7 @@ unsigned long lastSaveMs = 0;
 
 // Autonomous AI Brain State (Shared with Core 0)
 String geminiKey = "";
-String geminiModel = "gemini-2.5-flash-lite";
+String geminiModel = "gemini-3.8-flash";
 bool autoBrainOn = false;
 int brainIntervalMin = 20;
 volatile bool triggerBrainNow = false;
@@ -197,7 +197,7 @@ void loadAll() {
   hiCatch          = prefs.getInt("hiC", 0);
   ghRepo           = prefs.getString("gh", "");
   geminiKey        = prefs.getString("gKey", "");
-  geminiModel      = prefs.getString("gMod", "gemini-2.5-flash-lite");
+  geminiModel      = prefs.getString("gMod", "gemini-3.8-flash");
   autoBrainOn      = prefs.getBool("aBrn", false);
   brainIntervalMin = prefs.getInt("bInt", 20);
   prefs.end();
@@ -214,7 +214,6 @@ String jsonEscape(const String& s) {
   return out;
 }
 
-// Flexible lightweight JSON string extractor (handles whitespace & escaped quotes)
 String extractJsonStr(const String& json, const char* key) {
   String pat = String("\"") + key + "\"";
   int idx = json.indexOf(pat);
@@ -402,7 +401,6 @@ void bgAutoBrain() {
     int code = http.POST(body);
     if (code == HTTP_CODE_OK) {
       String resp = http.getString();
-      // Gemini wraps JSON inside "text": "{...}"
       String inner = extractJsonStr(resp, "text");
       if (inner.length() > 5) {
         String m = extractJsonStr(inner, "mood");
@@ -920,7 +918,7 @@ void pollIR() {
   if (!irStable && irWaves > 0 && (now - irUpAt > 520)) { int c = irWaves; irWaves = 0; onGesture(c, false); }
 }
 
-// ================= 4-TAB CYBER WEB UI (v6.2 AI AGENT) =================
+// ================= 4-TAB CYBER WEB UI (v6.2 + LIVE OLED PREVIEW) =================
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -931,7 +929,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 :root{--bg:#090b10;--card:#121622;--btn:#1b2234;--cyan:#22d3ee;--amber:#fbbf24;--emerald:#34d399;--rose:#f43f5e;--purp:#a855f7;}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:#f1f5f9;margin:0;padding:16px 14px 86px;}
-.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding:0 2px;}
+.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding:0 2px;}
 .hdr h2{margin:0;font-size:20px;color:#fff;}
 .badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:99px;background:rgba(168,85,247,.16);color:#d8b4fe;border:1px solid rgba(168,85,247,.38);}
 .pg{display:none;}.pg.on{display:block;animation:up .16s ease;}
@@ -968,6 +966,15 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 <div id="tst">OK</div>
 <div class="hdr"><h2>Riddhi OS</h2><span class="badge">v6.2 &bull; AI Brain</span></div>
 
+<!-- LIVE INTERACTIVE OLED PREVIEW -->
+<div class="box" style="text-align:center;padding:10px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span class="lbl" style="margin:0">Live OLED (Tap: 1x &bull; Hold: IR Hold)</span>
+    <button id="pvBtn" class="cy" style="padding:4px 10px;font-size:11px;border-radius:99px" onclick="togPv()">LIVE: ON</button>
+  </div>
+  <canvas id="oledCv" width="128" height="64" style="width:100%;max-width:256px;aspect-ratio:2/1;background:#04070d;border:2px solid rgba(34,211,238,.45);border-radius:10px;image-rendering:pixelated;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:pointer"></canvas>
+</div>
+
 <!-- TAB 1: AI AGENT & AUTONOMOUS BRAIN -->
 <div id="t-ai" class="pg on">
   <div class="box ai-box">
@@ -991,9 +998,8 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
     <div id="kBox" style="display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px">
       <input id="ak" type="password" placeholder="Paste Google AI Studio API Key">
       <select id="am">
-        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (Fast &amp; Light)</option>
-        <option value="gemini-2.5-flash">gemini-2.5-flash (Smart)</option>
-        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+        <option value="gemini-3.8-flash">gemini-3.8-flash (Recommended)</option>
+        <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Fastest)</option>
       </select>
       <button class="cy" style="width:100%" onclick="saveK()">Save Key to Phone + ESP32</button>
     </div>
@@ -1148,7 +1154,8 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(9,11,16,.95);backdrop
 <script>
 let hist=[], ttsOn=false;
 const k0=localStorage.getItem('rk')||''; document.getElementById('ak').value=k0;
-if(localStorage.getItem('rm')) document.getElementById('am').value=localStorage.getItem('rm');
+const m0=localStorage.getItem('rm')||'';
+if(m0==='gemini-3.8-flash'||m0==='gemini-3.5-flash-lite') document.getElementById('am').value=m0;
 if(!k0) document.getElementById('kBox').style.display='block';
 
 function tab(id,el){
@@ -1259,7 +1266,7 @@ for(const a of arr.slice(0,6)){
 }return o.join('|');}
 
 async function runAI(){
-  const k=localStorage.getItem('rk')||'', m=localStorage.getItem('rm')||'gemini-2.5-flash-lite', p=document.getElementById('aiIn').value.trim(), out=document.getElementById('aiOut');
+  const k=localStorage.getItem('rk')||'', m=localStorage.getItem('rm')||'gemini-3.8-flash', p=document.getElementById('aiIn').value.trim(), out=document.getElementById('aiOut');
   if(!k){document.getElementById('kBox').style.display='block';out.innerText='Add Gemini API Key first.';return;}
   if(!p)return; document.getElementById('aiIn').value=''; out.innerText='Executing...'; fetch('/aithink');
   const sys='You are Riddhi v6.2, an AI-controlled ESP32 desk robot (128x64 OLED). Return ONLY JSON: {"mood":"CHILL|HYPED|ZEN|GRUMPY|SHOCKED|SUS|SMUG|DIZZY|LOVE|SLEEP","reply":"short ASCII <54 chars","shapes":[],"actions":[]}. Supported actions array items: {"op":"POMO","arg":25}, {"op":"BANNER","a":"TOP","b":"SUB"}, {"op":"TASK_SET","idx":0,"text":"Task"}, {"op":"TASK_TOG","idx":0}, {"op":"TALLY","val":10}, {"op":"DIM","val":1}, {"op":"FLIP","val":1}, {"op":"HOLIDAY","val":1}, {"op":"CHEER"}, {"op":"SCREEN","val":"FACE|TASKS|CLOCK|WEATHER|POMO|COUNTER|DICE|BREATH|BANNER|SPACE|FLAPPY|PONG|CATCH"}. For custom faces put primitives (rbox,disc,circle,line,arc) in shapes[].';
@@ -1283,11 +1290,77 @@ async function runAI(){
     if(ttsOn&&'speechSynthesis'in window){window.speechSynthesis.cancel();window.speechSynthesis.speak(new SpeechSynthesisUtterance(j.reply||''));}
   }catch(e){out.innerText='Err: '+e.message; fetch('/mood?m=7');}
 }
+
+// ================= LIVE INTERACTIVE OLED PREVIEW =================
+let pvOn=true, pvBusy=false, cvTimer=null, cvHeld=false;
+const cv=document.getElementById('oledCv'), ctx=cv.getContext('2d'), imgD=ctx.createImageData(128,64);
+
+function togPv(){
+  pvOn=!pvOn;
+  const b=document.getElementById('pvBtn');
+  b.innerText='LIVE: '+(pvOn?'ON':'OFF');
+  b.className=pvOn?'cy':'';
+}
+
+async function drawOled(){
+  if(!pvOn||pvBusy||document.hidden) return;
+  pvBusy=true;
+  try{
+    const r=await fetch('/oled');
+    if(r.ok){
+      const bytes=new Uint8Array(await r.arrayBuffer());
+      if(bytes.length>=1024){
+        const d=imgD.data;
+        for(let y=0;y<64;y++){
+          const rowOff=(y>>3)*128, bit=1<<(y&7);
+          for(let x=0;x<128;x++){
+            const on=(bytes[rowOff+x]&bit)!==0, idx=(y*128+x)*4;
+            d[idx]=on?34:4; d[idx+1]=on?211:7; d[idx+2]=on?238:13; d[idx+3]=255;
+          }
+        }
+        ctx.putImageData(imgD,0,0);
+      }
+    }
+  }catch(e){}
+  pvBusy=false;
+}
+setInterval(drawOled, 350);
+
+cv.addEventListener('contextmenu', e=>e.preventDefault());
+cv.addEventListener('pointerdown', e=>{
+  e.preventDefault();
+  cvHeld=false;
+  cv.style.borderColor='#fbbf24';
+  cvTimer=setTimeout(()=>{
+    cvHeld=true;
+    cv.style.borderColor='#34d399';
+    fetch('/g?h=1');
+    tst('IR Hold');
+    setTimeout(drawOled, 120);
+  }, 650);
+});
+function endCv(isUp){
+  clearTimeout(cvTimer);
+  cv.style.borderColor='rgba(34,211,238,.45)';
+  if(isUp && !cvHeld){
+    fetch('/g?w=1');
+    setTimeout(drawOled, 80);
+  }
+}
+cv.addEventListener('pointerup', ()=>endCv(true));
+cv.addEventListener('pointercancel', ()=>endCv(false));
+cv.addEventListener('pointerleave', ()=>endCv(false));
 </script></body></html>
 )rawliteral";
 
 void setupWeb() {
   server.on("/", []() { server.send_P(200, "text/html", HTML_PAGE); });
+
+  server.on("/oled", []() {
+    server.setContentLength(1024);
+    server.send(200, "application/octet-stream", "");
+    server.client().write(u8g2.getBufferPtr(), 1024);
+  });
 
   server.on("/status", []() {
     String tArr = "[";
@@ -1341,7 +1414,13 @@ void setupWeb() {
   server.on("/cnt", []() { if (server.hasArg("inc")) tallyCount += server.arg("inc").toInt(); if (server.hasArg("reset")) tallyCount = 0; stateDirty = true; currentScreen = SCR_COUNTER; lastAct = millis(); server.send(200, "text/plain", "OK"); });
   server.on("/dice", []() { currentScreen = SCR_DICE; diceVal = random(1, 7); oracleYes = random(0, 2); diceRollUntil = millis() + 650; lastAct = millis(); server.send(200, "text/plain", "OK"); });
   server.on("/banner", []() { if (server.hasArg("t")) bannerTop = server.arg("t").substring(0, 16); if (server.hasArg("s")) bannerSub = server.arg("s").substring(0, 20); currentScreen = SCR_BANNER; lastAct = millis(); server.send(200, "text/plain", "OK"); });
-  server.on("/g", []() { onGesture(server.arg("w").toInt(), false); server.send(200, "text/plain", "OK"); });
+
+  server.on("/g", []() {
+    bool isHold = (server.hasArg("h") && server.arg("h").toInt() != 0);
+    onGesture(server.arg("w").toInt(), isHold);
+    server.send(200, "text/plain", "OK");
+  });
+
   server.on("/mood", []() { currentScreen = SCR_FACE; currentMood = (Mood)server.arg("m").toInt(); tempMoodEnd = 0; lastAct = millis(); wasSleeping = false; server.send(200, "text/plain", "OK"); });
   server.on("/scr", []() { ScreenMode s = (ScreenMode)server.arg("s").toInt(); if (isGame(s)) startGame(s); else currentScreen = s; lastAct = millis(); server.send(200, "text/plain", "OK"); });
 
@@ -1407,7 +1486,6 @@ void setup() {
   }
 
   setupWeb();
-  // 8192-byte stack on Core 0 to safely run TLS HTTPS Gemini calls without blocking Core 1
   xTaskCreatePinnedToCore(core0Task, "Core0AI", 8192, NULL, 1, NULL, 0);
 
   u8g2.clearBuffer(); drawWifi(); u8g2.sendBuffer(); delay(2400);
@@ -1425,7 +1503,6 @@ void loop() {
 
   if (triggerGhOta) { triggerGhOta = false; runGitHubOTA(); }
 
-  // Apply Autonomous Core 0 Brain decisions smoothly on Core 1
   if (brainHasUpdate && !isGame(currentScreen)) {
     if (xSemaphoreTake(netMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       brainHasUpdate = false;
